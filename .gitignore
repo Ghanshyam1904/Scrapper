@@ -1,0 +1,43 @@
+# Environment variables and API credentials
+.env
+.env.local
+.env.*.local
+*.env
+
+# Persistent browser sessions & authentication cookies
+browser_profile/
+chrome_profile/
+
+# Python virtual environments
+myenv/
+venv/
+.venv/
+env/
+ENV/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Crawl4AI & Playwright temporary downloads
+.crawl4ai/
+playwright-report/
+test-results/
+
+# Scraped data outputs & agent working state
+data/*.csv
+data/*.json
+agent_memory.json
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS temporary files
+.DS_Store
+Thumbs.db
