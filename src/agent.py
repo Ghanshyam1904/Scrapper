@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 
 from src.config import (
     LLM_PROVIDER,
@@ -20,10 +21,17 @@ from src.tools import (
 
 
 async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int = 30):
+    count_match = re.search(
+        r"\b(?:first|top|at least)\s+(\d+)\b|\b(\d+)\s+(?:countries|records|items|products|jobs|books|quotes|articles|reviews|rows)\b",
+        user_goal,
+        re.IGNORECASE,
+    )
+    requested_count = int(count_match.group(1) or count_match.group(2)) if count_match else None
+
     csv_filename = resolve_csv_path(csv_filename)
     PAGE_CACHE.clear()
     seen_calls: set[tuple] = set()
-    memory = WorkingMemory(url)
+    memory = WorkingMemory(url, requested_count=requested_count)
     system_prompt = load_system_prompt(SYSTEM_PROMPT_FILE)
     tools = build_tools()
 
@@ -59,18 +67,29 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
         messages.append(history_msg)
 
         if not tool_calls:
-            if not saved_csv and not login_skipped and nudge_count < 2:
+            incomplete = bool(
+                requested_count
+                and memory.total_saved_count < requested_count
+                and not login_skipped
+            )
+            if (not saved_csv or incomplete) and not login_skipped and nudge_count < 3:
                 nudge_count += 1
-                print(f"  [Guardrail] '{csv_filename}' has not been created yet; prompting agent to save ({nudge_count}/2)...")
-                messages.append({
-                    "role": "user",
-                    "content": (
+                if not saved_csv:
+                    print(f"  [Guardrail] '{csv_filename}' has not been created yet; prompting agent to save ({nudge_count}/3)...")
+                    nudge_msg = (
                         f"You have NOT called save_to_csv yet and '{csv_filename}' was not created. "
-                        f"Check [AGENT WORKING MEMORY] for unvisited URLs and notes. "
-                        f"If you need to search with filters/location, call search_on_website. "
-                        f"If you found valid items, call save_to_csv(filename='{csv_filename}', items=[...], append=False) NOW."
-                    ),
-                })
+                        "Check [AGENT WORKING MEMORY] and save valid items NOW."
+                    )
+                else:
+                    print(f"  [Guardrail] Incomplete ({memory.total_saved_count}/{requested_count} saved); prompting agent to continue ({nudge_count}/3)...")
+                    nudge_msg = (
+                        f"INCOMPLETE EXTRACTION: User requested {requested_count} unique records, "
+                        f"but only {memory.total_saved_count} are saved in CSV so far! "
+                        f"Read the next unread chunk using start_char or next unvisited URL from [AGENT WORKING MEMORY] "
+                        f"and save the remaining {requested_count - memory.total_saved_count} unique records using exact headers {memory.saved_headers}. "
+                        "Only stop if the source truly has fewer total records."
+                    )
+                messages.append({"role": "user", "content": nudge_msg})
                 continue
 
             print("\nAgent Final Response:\n", text_content)
@@ -146,7 +165,7 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                     login_skipped=login_skipped,
                     memory=memory,
                 )
-                if str(tool_output).startswith("Saved "):
+                if str(tool_output).startswith("Saved ") or (memory is not None and memory.total_saved_count > 0):
                     saved_csv = True
             else:
                 tool_output = f"Unknown tool: {fn_name}"

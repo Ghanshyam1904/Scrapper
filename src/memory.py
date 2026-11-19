@@ -29,14 +29,17 @@ def _domain_of(url: str) -> str:
 
 
 class WorkingMemory:
-    def __init__(self, target_url: str):
+    def __init__(self, target_url: str, requested_count: int | None = None):
         self.target_url = target_url.split("#")[0]
         self.domain = _domain_of(target_url)
+        self.requested_count = requested_count
         self.visited_urls: list[str] = []
         self.broken_urls: list[str] = []
         self.pending_urls: list[str] = []
         self.notes: list[str] = []
         self.saved_summaries: list[str] = []
+        self.saved_headers: list[str] = []
+        self.total_saved_count: int = 0
         self.site_memory: dict = _load_site_memory()
 
     def mark_visited(self, url: str) -> None:
@@ -99,7 +102,9 @@ class WorkingMemory:
                 self.notes = self.notes[-10:]
         return f"Memory note saved ({len(self.notes)} total notes)."
 
-    def record_saved_rows(self, items: list[dict]) -> None:
+    def record_saved_rows(self, items: list[dict], headers: list[str], total_count: int) -> None:
+        self.saved_headers = list(headers)
+        self.total_saved_count = total_count
         for item in items:
             compact = ", ".join(f"{k}={str(v)[:50]}" for k, v in item.items())
             self.saved_summaries.append(compact)
@@ -127,12 +132,16 @@ class WorkingMemory:
         domain_info = self.site_memory.get(self.domain, {})
         if domain_info.get("working_keywords"):
             lines.append(f"- Known useful keywords on {self.domain}: {', '.join(domain_info['working_keywords'])}")
+
+        target_str = f" / {self.requested_count} requested" if self.requested_count else ""
+        lines.append(f"- Unique rows saved to CSV: {self.total_saved_count}{target_str}")
+        if self.saved_headers:
+            lines.append(f"- LOCKED CSV headers (must match exactly): {', '.join(self.saved_headers)}")
+
         if self.saved_summaries:
-            lines.append(f"- Already saved to CSV ({len(self.saved_summaries)} rows):")
-            for idx, s in enumerate(self.saved_summaries[-8:], 1):
+            lines.append("- Latest saved rows:")
+            for idx, s in enumerate(self.saved_summaries[-6:], 1):
                 lines.append(f"  {idx}. {s}")
-        else:
-            lines.append("- Already saved to CSV: 0 rows")
 
         if self.notes:
             lines.append("- Saved scratchpad notes:")

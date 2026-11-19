@@ -210,14 +210,20 @@ async def scrape_website(
                 f"If you want to search the website for '{keyword}', call search_on_website(url='{cache_url}', query='{keyword}').]"
             )
 
-    chunk = text[start_char : start_char + 3000]
-    next_off = start_char + len(chunk)
+    raw_end = min(total_len, start_char + 3000)
+    if raw_end < total_len:
+        nl_pos = text.rfind("\n", start_char + 2200, min(total_len, start_char + 3200))
+        end_char = (nl_pos + 1) if nl_pos > start_char + 2000 else raw_end
+    else:
+        end_char = total_len
+
+    chunk = text[start_char:end_char]
     more_hint = (
-        f" — Call start_char={next_off} on THIS URL if items are further down before visiting other links."
-        if next_off < total_len
-        else ""
+        f" — Call start_char={end_char} on THIS URL to read the next complete records."
+        if end_char < total_len
+        else " — END OF PAGE REACHED."
     )
-    return f"[Total: {total_len} chars | Showing {start_char} to {next_off}{more_hint}]\n{chunk}"
+    return f"[Total: {total_len} chars | Showing {start_char} to {end_char}{more_hint}]\n{chunk}"
 
 
 # ---------------- TOOL 2: Universal In-Site Search (With Section, Location & Filters) ----------------
@@ -567,7 +573,53 @@ async def login_or_signup_with_email(url: str, seen_calls: set) -> tuple[str, bo
 
 
 # ---------------- TOOL 4: Validated Incremental CSV Saver ----------------
+_TEXT_COL_HINTS = (
+    "country", "capital", "city", "state", "author", "reviewer",
+    "company", "title", "job_title", "model_name", "book_title", "name",
+)
+_NUMERIC_COL_HINTS = (
+    "population", "area", "km2", "sq_km", "price", "cost",
+    "amount", "points", "salary", "followers", "upvotes",
+)
+_EXEMPT_WORDS = ("id", "code", "rank", "count", "num", "number", "year", "url", "link", "rating")
+
+
+def _validate_semantic_mapping(items: list[dict]) -> str | None:
+    """Catch swapped columns like putting area '27400' in country_name or 'Albania' in area_km2."""
+    for idx, item in enumerate(items, 1):
+        for col, val in item.items():
+            if val is None or _is_placeholder(val):
+                continue
+            col_low = str(col).strip().lower()
+            sval = str(val).strip()
+            if any(w in col_low for w in _EXEMPT_WORDS):
+                continue
+
+            if any(h in col_low for h in _TEXT_COL_HINTS) and not any(h in col_low for h in _NUMERIC_COL_HINTS):
+                # Purely numeric value inside a text/name column
+                if re.fullmatch(r"[\d,.\s]+", sval):
+                    return (
+                        f"REJECTED (Semantic Mapping Error in row {idx}): Column '{col}' expects a text/name value, "
+                        f"but received numeric '{sval}'. Check your key-to-value mapping and retry."
+                    )
+
+            if any(h in col_low for h in _NUMERIC_COL_HINTS):
+                # Purely alphabetic words with zero digits inside a numeric metric column
+                if re.search(r"[A-Za-z]", sval) and not re.search(r"\d", sval):
+                    return (
+                        f"REJECTED (Semantic Mapping Error in row {idx}): Column '{col}' expects a numeric value, "
+                        f"but received text '{sval}'. Check your key-to-value mapping and retry."
+                    )
+    return None
+
+
+def _row_signature(row: dict, keys: list[str]) -> tuple:
+    return tuple(re.sub(r"\s+", " ", str(row.get(k, "")).strip().lower()) for k in keys)
+
+
 def _is_placeholder(val) -> bool:
+    if val is None:
+        return True
     v = str(val).strip().lower()
     if v in {"", "n/a", "na", "none", "unknown", "null", "-"}:
         return True
@@ -619,16 +671,39 @@ def save_to_csv(
             "If mandatory login is needed, call login_or_signup_with_email(url). Only save rows with real extracted values."
         )
 
+    # 1. Semantic column-to-value validation
+    sem_error = _validate_semantic_mapping(valid_items)
+    if sem_error:
+        print(f"  [Validation Blocked] {sem_error}")
+        return sem_error
+
     full_path = resolve_csv_path(filename)
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     file_exists = os.path.exists(full_path) and os.path.getsize(full_path) > 0
 
-    keys = []
+    existing_sigs: set[tuple] = set()
+    keys: list[str] = []
+
     if append and file_exists:
         with open(full_path, mode="r", newline="", encoding="utf-8-sig") as rf:
-            keys = next(csv.reader(rf), [])
+            reader = list(csv.reader(rf))
+            if reader:
+                keys = reader[0]
+                for existing_row in reader[1:]:
+                    padded = (existing_row + [""] * len(keys))[: len(keys)]
+                    existing_sigs.add(tuple(re.sub(r"\s+", " ", c.strip().lower()) for c in padded))
 
+    # 2. Enforce consistent headers across incremental calls
     if append and file_exists and keys:
+        incoming_keys = set()
+        for it in valid_items:
+            incoming_keys.update(it.keys())
+        overlap = [k for k in keys if k in incoming_keys]
+        if len(overlap) < max(1, len(keys) // 2):
+            return (
+                f"REJECTED (Header Mismatch): Existing CSV columns are {keys}, "
+                f"but you passed {sorted(incoming_keys)}. Reuse exact column names {keys}."
+            )
         mode = "a"
         write_header = False
     else:
@@ -639,17 +714,41 @@ def save_to_csv(
                     keys.append(k)
         mode = "w"
         write_header = True
+        existing_sigs.clear()
+
+    # 3. Deduplicate against existing CSV rows and within batch
+    deduped_items: list[dict] = []
+    dup_count = 0
+    for item in valid_items:
+        sig = _row_signature(item, keys)
+        if sig in existing_sigs:
+            dup_count += 1
+            continue
+        existing_sigs.add(sig)
+        clean_row = {k: ("" if item.get(k) is None else item.get(k)) for k in keys}
+        deduped_items.append(clean_row)
+
+    if not deduped_items:
+        total_now = len(existing_sigs)
+        return (
+            f"All {len(valid_items)} submitted rows were duplicates already in CSV. "
+            f"Total unique rows in CSV: {total_now}. Continue reading new chunks or unvisited URLs."
+        )
 
     with open(full_path, mode=mode, newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         if write_header:
             writer.writeheader()
-        writer.writerows(valid_items)
+        writer.writerows(deduped_items)
 
+    total_now = len(existing_sigs)
     if memory is not None:
-        memory.record_saved_rows(valid_items)
+        memory.record_saved_rows(deduped_items, headers=keys, total_count=total_now)
 
-    print(f"  [CSV Saved] {len(valid_items)} valid rows -> {full_path}")
-    for row in valid_items:
+    print(f"  [CSV Saved] +{len(deduped_items)} unique rows (skipped {dup_count} dups) | Total: {total_now} -> {full_path}")
+    for row in deduped_items:
         print(f"    -> {row}")
-    return f"Saved {len(valid_items)} real rows to {full_path}. Check [AGENT WORKING MEMORY] for remaining unvisited URLs."
+    return (
+        f"Saved {len(deduped_items)} new unique rows (skipped {dup_count} duplicates). "
+        f"Total unique rows in CSV: {total_now}. Columns: {keys}."
+    )
