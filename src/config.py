@@ -18,6 +18,7 @@ SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", os.path.join(BASE_DIR, "sys
 if not os.path.isabs(SYSTEM_PROMPT_FILE):
     SYSTEM_PROMPT_FILE = os.path.join(BASE_DIR, SYSTEM_PROMPT_FILE)
 DEFAULT_LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 GROQ_FALLBACK_MODELS = [
     "openai/gpt-oss-120b",
@@ -35,8 +36,8 @@ if LLM_PROVIDER == "groq":
 elif LLM_PROVIDER != "ollama":
     raise ValueError(f"Unsupported LLM_PROVIDER='{LLM_PROVIDER}'. Use 'ollama' or 'groq'.")
 
-# Shared in-run page cache
 PAGE_CACHE: dict[str, str] = {}
+DOM_SAMPLE_CACHE: dict[str, str] = {}
 
 # ---------------- DETECTION PHRASES ----------------
 ERROR_PHRASES = (
@@ -52,13 +53,32 @@ BOT_BLOCK_PHRASES = (
     "just a moment...",
     "checking your browser",
     "verify you are human",
+    "you are human",
+    "your are human",
     "are you a human",
+    "robot or human",
+    "activate and hold",
+    "confirm that you’re human",
+    "confirm that you're human",
+    "confirm you are not a robot",
+    "confirm you're human",
+    "verify you're human",
+    "sorry, we just need to make sure you're not a robot",
+    "click the button below to continue shopping",
+    "enter the characters you see below",
+    "type the characters you see in this image",
+    "solve this puzzle",
+    "robot check",
+    "press & hold",
     "access denied",
     "403 forbidden",
     "enable javascript and cookies",
     "unusual traffic from your computer",
     "attention required! | cloudflare",
     "pardon our interruption",
+    "blocked by network security",
+    "whoa there, pardner",
+    "geo.captcha-delivery.com",
 )
 
 MANDATORY_LOGIN_PHRASES = (
@@ -94,16 +114,12 @@ LINKEDIN_GATE_MARKERS = (
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a precision autonomous web scraping AI agent. "
-    "Always call scrape_website first on the Target URL and read through its contents before opening sub-links. "
-    "If the user asks for a topic, product, or job not present on a homepage, call search_on_website "
-    "(pass 'section', 'location', and 'filters' when requested). "
-    "Use save_memory_note to store partial facts while searching for remaining fields. "
-    "Check [AGENT WORKING MEMORY] at the top before every step to see pending URLs and already-saved items. "
-    "ONLY if scrape_website or search_on_website reports [MANDATORY LOGIN WALL DETECTED] or redirects to sign-in, "
-    "call login_or_signup_with_email once then re-scrape/re-search. "
-    "If public data is visible, NEVER ask for login. "
-    "Never call login_or_signup_with_email on a 404 or 'moved or deleted' page. "
-    "Extract ONLY requested fields, save via save_to_csv immediately after EACH item, and never invent fake data."
+    "Always call scrape_website first on the Target URL. "
+    "When [DOM Structure Sample] shows repeating items, prefer extract_with_selectors for fast verbatim extraction. "
+    "If [PAGINATION DETECTED] or clickable Next/page buttons exist, call extract_with_selectors(..., mode='ajax' or 'url_pagination') or ajax_paginate_and_scrape. "
+    "If the page uses infinite scrolling, call extract_with_selectors(..., mode='scroll') or scroll_and_scrape. "
+    "If the Target URL lacks the requested topic/items and has a search bar, call search_on_website. "
+    "Use exact user-requested column names and save incrementally via save_to_csv."
 )
 
 DISMISS_POPUPS_JS = """
@@ -112,21 +128,37 @@ DISMISS_POPUPS_JS = """
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
         const closeSelectors = [
             "button[aria-label*='close' i]",
-            "span[role='button']",
+            "button[aria-label*='dismiss' i]",
+            "[class*='close' i][role='button']",
             "button._2KpZ6l._2doB4z",
             "span._30XB9F",
-            "[class*='close' i][role='button']",
-            "button:has-text('No thanks')",
-            "button:has-text('Skip')"
+            "#onetrust-accept-btn-handler"
         ];
         for (const sel of closeSelectors) {
             try {
                 const el = document.querySelector(sel);
-                if (el && el.offsetParent !== null && (el.innerText.trim().length <= 12 || sel.includes('close') || sel.includes('30XB9F'))) {
+                if (el && el.offsetParent !== null) {
                     el.click();
                 }
             } catch (e) {}
         }
+        const dismissLabels = new Set(['no thanks', 'skip', 'not now', 'close', 'dismiss', 'accept all', 'got it']);
+        for (const btn of document.querySelectorAll("button, [role='button']")) {
+            try {
+                if (!btn || btn.offsetParent === null) continue;
+                const txt = (btn.innerText || '').trim().toLowerCase();
+                if (txt.length > 0 && txt.length <= 20 && dismissLabels.has(txt)) {
+                    btn.click();
+                }
+            } catch (e) {}
+        }
+        document.querySelectorAll('a[title]').forEach(a => {
+            const t = (a.innerText || '').trim();
+            const full = (a.getAttribute('title') || '').trim();
+            if (full.length > t.length && (t.endsWith('...') || t.endsWith('…'))) {
+                a.innerText = full;
+            }
+        });
     } catch (e) {}
 })();
 """

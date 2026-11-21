@@ -1,5 +1,5 @@
+import asyncio
 import json
-import time
 from groq import APIStatusError
 
 from src.config import (
@@ -27,8 +27,8 @@ def build_tools() -> list[dict]:
             "function": {
                 "name": "scrape_website",
                 "description": (
-                    "Fetch clean text and links from a URL. Use 'keyword' (like 'Customer reviews', 'Ratings', 'Price') "
-                    "to jump straight to sections on large pages, or 'start_char' with keyword='' to browse offsets."
+                    "Fetch clean text, structured tables/JSON-LD, links, and a [DOM Structure Sample] from a URL. "
+                    "Use 'start_char' to read unread offsets or 'keyword' to jump to sections."
                 ),
                 "parameters": {
                     "type": "object",
@@ -44,9 +44,80 @@ def build_tools() -> list[dict]:
         {
             "type": "function",
             "function": {
+                "name": "extract_with_selectors",
+                "description": (
+                    "FASTEST tool for repeating lists/cards/rows when you know exact CSS selectors from [DOM Structure Sample]. "
+                    "Use standard CSS selectors only (no :has-text). Supports ::attr(href) syntax. "
+                    "If selectors are obfuscated or fail twice, use scrape_website + save_to_csv instead."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Full URL starting with https://"},
+                        "item_selector": {"type": "string", "description": "CSS selector for each item container (e.g. '.quote', 'div.thumbnail', 'tr')"},
+                        "field_selectors": {
+                            "type": "object",
+                            "description": "Map of exact requested CSV column name -> CSS selector inside item_selector",
+                        },
+                        "max_items": {"type": "integer", "description": "Exact number of unique records requested (e.g. 50, 30)"},
+                        "mode": {
+                            "type": "string",
+                            "description": "One of: 'single' (current page), 'scroll' (infinite scroll), 'ajax' (clickable Next/numbered buttons), 'url_pagination'",
+                        },
+                        "unique_fields": {
+                            "type": "array",
+                            "description": "Optional composite key columns for deduplication (e.g. ['quote', 'author'], ['team_name', 'year'])",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["url", "item_selector", "field_selectors", "max_items", "mode"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "scroll_and_scrape",
+                "description": (
+                    "Perform real browser infinite scrolling on dynamic pages (works on both window and nested scroll containers). "
+                    "Pass start_char > 0 to read later chunks of an already-scrolled page."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Full URL starting with https://"},
+                        "max_scrolls": {"type": "integer", "description": "Maximum scroll steps to perform (default 12)"},
+                        "start_char": {"type": "integer", "description": "Character offset to return (default 0)"},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ajax_paginate_and_scrape",
+                "description": (
+                    "Click interactive pagination buttons ('Next', '2', '3', 'Load more') across multiple pages in one browser session, "
+                    "wait for DOM updates on each page, and return all collected pages cleanly."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Full URL starting with https://"},
+                        "max_pages": {"type": "integer", "description": "Maximum number of pages to click through (default 6)"},
+                        "start_char": {"type": "integer", "description": "Character offset to return (default 0)"},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "search_on_website",
                 "description": (
-                    "Search for a topic, job, article, or product using the website's own search bar. "
+                    "Search for a topic, job, article, hotel, or product using the website's own search bar. "
                     "Supports optional section tab (e.g. 'Jobs'), location (e.g. 'India'), and UI filters (e.g. ['Past 24 hours', 'Entry level'])."
                 ),
                 "parameters": {
@@ -71,8 +142,8 @@ def build_tools() -> list[dict]:
             "function": {
                 "name": "save_memory_note",
                 "description": (
-                    "Save partial extracted facts (e.g., product model, price, rating) into working memory "
-                    "while you search further down the page for remaining fields (e.g., review, reviewer_name)."
+                    "Save temporary scratchpad facts into working memory while browsing further down a page. "
+                    "NEVER use this as a replacement for save_to_csv. Memory notes do NOT write to CSV."
                 ),
                 "parameters": {
                     "type": "object",
@@ -87,7 +158,10 @@ def build_tools() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "save_to_csv",
-                "description": "Save extracted items into CSV immediately after finding each item.",
+                "description": (
+                    "Save extracted items into CSV immediately after finding them on a page. "
+                    "Use the EXACT snake_case column names requested by the user."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -98,6 +172,11 @@ def build_tools() -> list[dict]:
                             "items": {"type": "object"},
                         },
                         "append": {"type": "boolean", "description": "True to append, false to overwrite"},
+                        "unique_fields": {
+                            "type": "array",
+                            "description": "Optional composite key column names for deduplication (e.g. ['quote', 'author'], ['team_name', 'year']).",
+                            "items": {"type": "string"},
+                        },
                     },
                     "required": ["filename", "items"],
                 },
@@ -109,18 +188,56 @@ def build_tools() -> list[dict]:
                 "name": "login_or_signup_with_email",
                 "description": (
                     "ONLY call this if scrape_website or search_on_website reports [MANDATORY LOGIN WALL DETECTED] or redirects to sign-in. "
-                    "NEVER call this if public data is already visible or for a 404 page."
+                    "Only pass 'username' and 'password' if authorized demo credentials are explicitly printed on the page; otherwise leave them empty."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "url": {"type": "string", "description": "The login/signup or blocked page URL"}
+                        "url": {"type": "string", "description": "The login/signup or blocked page URL"},
+                        "username": {"type": "string", "description": "Optional authorized demo username/email printed on the page"},
+                        "password": {"type": "string", "description": "Optional authorized demo password printed on the page"},
                     },
                     "required": ["url"],
                 },
             },
         },
     ]
+
+
+def _compact_assistant_msg(msg: dict) -> dict:
+    tcs = msg.get("tool_calls")
+    if not tcs:
+        return msg
+
+    compact_tcs = []
+    changed = False
+    for tc in tcs:
+        fn = tc.get("function", {})
+        raw_args = fn.get("arguments", "")
+        is_dict_args = isinstance(raw_args, dict)
+        args_len = len(json.dumps(raw_args)) if is_dict_args else len(str(raw_args))
+
+        if fn.get("name") == "save_to_csv" and args_len > 500:
+            changed = True
+            note_payload = {"note": "older save_to_csv payload compacted; see [AGENT WORKING MEMORY]"}
+            new_tc = {
+                "type": tc.get("type", "function"),
+                "function": {
+                    "name": "save_to_csv",
+                    "arguments": note_payload if is_dict_args else json.dumps(note_payload),
+                },
+            }
+            if "id" in tc:
+                new_tc["id"] = tc["id"]
+            compact_tcs.append(new_tc)
+        else:
+            compact_tcs.append(tc)
+
+    if not changed:
+        return msg
+    new_msg = dict(msg)
+    new_msg["tool_calls"] = compact_tcs
+    return new_msg
 
 
 def trim_messages(messages: list, memory: WorkingMemory | None = None) -> list:
@@ -131,33 +248,39 @@ def trim_messages(messages: list, memory: WorkingMemory | None = None) -> list:
             "content": safe[0]["content"] + "\n\n" + memory.render(),
         }
 
-    if len(safe) <= 9:
+    if len(safe) <= 7:
         return safe
 
     trimmed = []
-    cutoff = len(safe) - 6
+    cutoff = len(safe) - 4
     for i, msg in enumerate(safe):
-        if 2 <= i < cutoff and isinstance(msg, dict) and msg.get("role") == "tool" and len(msg.get("content", "")) > 450:
-            content = msg.get("content", "")
-            compact = {
-                "role": "tool",
-                "content": content[:220] + "\n...[Older output trimmed — see [AGENT WORKING MEMORY] above for saved notes, URLs & CSV progress.]",
-            }
-            if "tool_call_id" in msg:
-                compact["tool_call_id"] = msg["tool_call_id"]
-            if "tool_name" in msg:
-                compact["tool_name"] = msg["tool_name"]
-            trimmed.append(compact)
+        if 2 <= i < cutoff and isinstance(msg, dict):
+            if msg.get("role") == "tool" and len(msg.get("content", "")) > 450:
+                content = msg.get("content", "")
+                compact = {
+                    "role": "tool",
+                    "content": content[:220] + "\n...[Older output trimmed — see [AGENT WORKING MEMORY] above for saved notes, URLs & CSV progress.]",
+                }
+                if "tool_call_id" in msg:
+                    compact["tool_call_id"] = msg["tool_call_id"]
+                if "tool_name" in msg:
+                    compact["tool_name"] = msg["tool_name"]
+                trimmed.append(compact)
+            elif msg.get("role") == "assistant":
+                trimmed.append(_compact_assistant_msg(msg))
+            else:
+                trimmed.append(msg)
         else:
             trimmed.append(msg)
     return trimmed
 
 
-def call_llm(safe_messages: list, tools: list, step: int):
+async def call_llm(safe_messages: list, tools: list, step: int):
     global CURRENT_GROQ_IDX
 
     if LLM_PROVIDER == "ollama":
-        response = ollama_client.chat(
+        response = await asyncio.to_thread(
+            ollama_client.chat,
             model=OLLAMA_MODEL,
             messages=safe_messages,
             tools=tools,
@@ -165,24 +288,39 @@ def call_llm(safe_messages: list, tools: list, step: int):
             options={"num_ctx": 12288, "temperature": 0.0},
         )
         msg = response.message
+        history_msg: dict = {"role": "assistant", "content": msg.content or ""}
         normalized_calls = []
-        for idx, tc in enumerate(msg.tool_calls or []):
-            raw_args = tc.function.arguments
-            if isinstance(raw_args, dict):
-                args = raw_args
-            else:
-                try:
-                    parsed = json.loads(raw_args)
-                    args = parsed if isinstance(parsed, dict) else {"_parse_error": "Tool arguments must be a JSON object."}
-                except json.JSONDecodeError:
-                    args = {"_parse_error": f"Invalid JSON arguments: {raw_args}"}
-            normalized_calls.append((f"ollama_{step}_{idx}", tc.function.name, args))
-        return msg, (msg.content or ""), normalized_calls
 
-    for _ in range(len(GROQ_FALLBACK_MODELS) + 2):
+        if msg.tool_calls:
+            ollama_tcs = []
+            for idx, tc in enumerate(msg.tool_calls):
+                raw_args = tc.function.arguments
+                if isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    try:
+                        parsed = json.loads(raw_args or "{}")
+                        args = parsed if isinstance(parsed, dict) else {"_parse_error": "Tool arguments must be a JSON object."}
+                    except json.JSONDecodeError:
+                        args = {"_parse_error": f"Invalid JSON arguments: {raw_args}"}
+
+                ollama_tcs.append({
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": args if "_parse_error" not in args else {},
+                    },
+                })
+                normalized_calls.append((f"ollama_{step}_{idx}", tc.function.name, args))
+            history_msg["tool_calls"] = ollama_tcs
+
+        return history_msg, (msg.content or ""), normalized_calls
+
+    for _ in range(len(GROQ_FALLBACK_MODELS) + 3):
         model_name = GROQ_FALLBACK_MODELS[CURRENT_GROQ_IDX % len(GROQ_FALLBACK_MODELS)]
         try:
-            response = groq_client.chat.completions.create(
+            response = await asyncio.to_thread(
+                groq_client.chat.completions.create,
                 model=model_name,
                 messages=safe_messages,
                 tools=tools,
@@ -192,30 +330,38 @@ def call_llm(safe_messages: list, tools: list, step: int):
             msg = response.choices[0].message
             history_msg = {"role": "assistant", "content": msg.content or ""}
             normalized_calls = []
+
             if msg.tool_calls:
                 history_msg["tool_calls"] = [
                     {
                         "id": tc.id,
                         "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
                     }
                     for tc in msg.tool_calls
                 ]
                 for tc in msg.tool_calls:
                     try:
-                        parsed = json.loads(tc.function.arguments)
+                        parsed = json.loads(tc.function.arguments or "{}")
                         args = parsed if isinstance(parsed, dict) else {"_parse_error": "Tool arguments must be a JSON object."}
                     except json.JSONDecodeError:
                         args = {"_parse_error": f"Invalid JSON arguments: {tc.function.arguments}"}
                     normalized_calls.append((tc.id, tc.function.name, args))
+
             return history_msg, (msg.content or ""), normalized_calls
         except APIStatusError as e:
             if e.status_code == 429 and "tokens per day" in str(e).lower():
                 print(f"  [TPD Full on {model_name}] Switching to next free Groq model...")
                 CURRENT_GROQ_IDX += 1
-            elif e.status_code in (413, 429):
-                print(f"  [Rate Limit {e.status_code} on {model_name}] Waiting 20s...")
-                time.sleep(20)
+            elif e.status_code == 413:
+                print(f"  [Payload Too Large 413 on {model_name}] Switching model...")
+                CURRENT_GROQ_IDX += 1
+            elif e.status_code == 429:
+                print(f"  [Rate Limit 429 on {model_name}] Waiting 20s...")
+                await asyncio.sleep(20)
+            elif e.status_code >= 500:
+                print(f"  [Server Error {e.status_code} on {model_name}] Waiting 5s...")
+                await asyncio.sleep(5)
             else:
                 raise
     raise RuntimeError("All Groq fallback models hit rate limits. Switch LLM_PROVIDER=ollama in .env!")
