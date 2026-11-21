@@ -6,22 +6,62 @@ from src.config import (
     LLM_PROVIDER,
     OLLAMA_MODEL,
     GROQ_FALLBACK_MODELS,
+    FREELLM_FALLBACK_MODELS,
+    MAX_OUTPUT_TOKENS,
     ollama_client,
     groq_client,
+    freellm_client,
 )
 from src.memory import WorkingMemory
 
 CURRENT_GROQ_IDX = 0
+CURRENT_FREELLM_IDX = 0
 
 
 def get_active_model() -> str:
     if LLM_PROVIDER == "ollama":
         return OLLAMA_MODEL
+    if LLM_PROVIDER == "freellm":
+        return FREELLM_FALLBACK_MODELS[CURRENT_FREELLM_IDX % len(FREELLM_FALLBACK_MODELS)]
     return GROQ_FALLBACK_MODELS[CURRENT_GROQ_IDX % len(GROQ_FALLBACK_MODELS)]
 
 
 def build_tools() -> list[dict]:
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "save_table_rows",
+                "description": "Save rows straight from the HTML table reported by [HTML TABLE FOUND]. Values are copied by code, never typed by you.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "columns": {"type": "object",
+                                    "description": "csv column name -> column index shown in the preview"},
+                        "first_data_row": {"type": "integer",
+                                           "description": "row_index of the first data row (skip header rows)"},
+                        "max_items": {"type": "integer"},
+                    },
+                    "required": ["url", "columns", "first_data_row", "max_items"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "save_jsonld_list",
+                "description": "Save the full list found in a page's JSON-LD ItemList straight to CSV. Use when scrape_website reports [STRUCTURED LIST FOUND].",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "max_items": {"type": "integer"},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
@@ -275,46 +315,139 @@ def trim_messages(messages: list, memory: WorkingMemory | None = None) -> list:
     return trimmed
 
 
+def _parse_tool_args(raw):
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw or "{}")
+        return parsed if isinstance(parsed, dict) else {"_parse_error": "Tool arguments must be a JSON object."}
+    except json.JSONDecodeError:
+        return {"_parse_error": f"Invalid JSON arguments: {raw}"}
+
+
+def _messages_for_ollama(messages: list) -> list:
+    """OpenAI-style messages (string arguments) ko Ollama ke dict-arguments format mein badlo."""
+    out = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("tool_calls"):
+            m = dict(m)
+            fixed = []
+            for tc in m["tool_calls"]:
+                fn = dict(tc.get("function", {}))
+                fn["arguments"] = _parse_tool_args(fn.get("arguments"))
+                if "_parse_error" in fn["arguments"]:
+                    fn["arguments"] = {}
+                fixed.append({"type": "function", "function": fn})
+            m["tool_calls"] = fixed
+        out.append(m)
+    return out
+
+
+async def _call_ollama(safe_messages: list, tools: list, step: int):
+    response = await asyncio.to_thread(
+        ollama_client.chat,
+        model=OLLAMA_MODEL,
+        messages=_messages_for_ollama(safe_messages),
+        tools=tools,
+        think=False,
+        options={"num_ctx": 12288, "temperature": 0.0},
+    )
+    msg = response.message
+    history_msg: dict = {"role": "assistant", "content": msg.content or ""}
+    normalized_calls = []
+
+    if msg.tool_calls:
+        ollama_tcs = []
+        for idx, tc in enumerate(msg.tool_calls):
+            args = _parse_tool_args(tc.function.arguments)
+            ollama_tcs.append({
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": args if "_parse_error" not in args else {},
+                },
+            })
+            normalized_calls.append((f"ollama_{step}_{idx}", tc.function.name, args))
+        history_msg["tool_calls"] = ollama_tcs
+
+    return history_msg, (msg.content or ""), normalized_calls
+
+
+def _parse_openai_style(response):
+    """Groq aur FreeLLMAPI dono ka response same format mein hota hai."""
+    msg = response.choices[0].message
+    history_msg = {"role": "assistant", "content": msg.content or ""}
+    normalized_calls = []
+
+    if msg.tool_calls:
+        history_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
+            }
+            for tc in msg.tool_calls
+        ]
+        for tc in msg.tool_calls:
+            normalized_calls.append((tc.id, tc.function.name, _parse_tool_args(tc.function.arguments)))
+
+    return history_msg, (msg.content or ""), normalized_calls
+
+
+async def _call_freellm(safe_messages: list, tools: list, step: int):
+    global CURRENT_FREELLM_IDX
+    n = len(FREELLM_FALLBACK_MODELS)
+    last_err = None
+
+    for _ in range(n * 2):
+        model_name = FREELLM_FALLBACK_MODELS[CURRENT_FREELLM_IDX % n]
+        try:
+            response = await asyncio.to_thread(
+                freellm_client.chat.completions.create,
+                model=model_name,
+                messages=safe_messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.0,
+                max_tokens=MAX_OUTPUT_TOKENS,
+            )
+            if not response.choices:
+                raise RuntimeError("Empty response")
+            return _parse_openai_style(response)
+        except Exception as e:
+            last_err = e
+            status = getattr(e, "status_code", None)
+            text = str(e).lower()
+
+            # Saari keys/limits khatam -> turant Ollama par girao
+            if status == 503 and "all models exhausted" in text:
+                print("  [FreeLLMAPI: all models exhausted] Falling back to Ollama...")
+                break
+            if status == 429:
+                print(f"  [Rate Limit 429 on {model_name}] Next model...")
+            elif status in (400, 404, 422):
+                print(f"  [{model_name} request reject kiya ({status}), shayad tools support nahi] Next model...")
+            elif status and status >= 500:
+                print(f"  [Server Error {status} on {model_name}] Next model...")
+            else:
+                print(f"  [{model_name} error: {str(e)[:100]}] Next model...")
+            CURRENT_FREELLM_IDX += 1
+            await asyncio.sleep(1)
+
+    if ollama_client is None:
+        raise RuntimeError(f"FreeLLMAPI fail hua aur Ollama client nahi hai: {last_err}")
+    print(f"  [Ollama fallback: {OLLAMA_MODEL}]")
+    return await _call_ollama(safe_messages, tools, step)
+
+
 async def call_llm(safe_messages: list, tools: list, step: int):
     global CURRENT_GROQ_IDX
 
     if LLM_PROVIDER == "ollama":
-        response = await asyncio.to_thread(
-            ollama_client.chat,
-            model=OLLAMA_MODEL,
-            messages=safe_messages,
-            tools=tools,
-            think=False,
-            options={"num_ctx": 12288, "temperature": 0.0},
-        )
-        msg = response.message
-        history_msg: dict = {"role": "assistant", "content": msg.content or ""}
-        normalized_calls = []
+        return await _call_ollama(safe_messages, tools, step)
 
-        if msg.tool_calls:
-            ollama_tcs = []
-            for idx, tc in enumerate(msg.tool_calls):
-                raw_args = tc.function.arguments
-                if isinstance(raw_args, dict):
-                    args = raw_args
-                else:
-                    try:
-                        parsed = json.loads(raw_args or "{}")
-                        args = parsed if isinstance(parsed, dict) else {"_parse_error": "Tool arguments must be a JSON object."}
-                    except json.JSONDecodeError:
-                        args = {"_parse_error": f"Invalid JSON arguments: {raw_args}"}
-
-                ollama_tcs.append({
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": args if "_parse_error" not in args else {},
-                    },
-                })
-                normalized_calls.append((f"ollama_{step}_{idx}", tc.function.name, args))
-            history_msg["tool_calls"] = ollama_tcs
-
-        return history_msg, (msg.content or ""), normalized_calls
+    if LLM_PROVIDER == "freellm":
+        return await _call_freellm(safe_messages, tools, step)
 
     for _ in range(len(GROQ_FALLBACK_MODELS) + 3):
         model_name = GROQ_FALLBACK_MODELS[CURRENT_GROQ_IDX % len(GROQ_FALLBACK_MODELS)]
@@ -326,29 +459,9 @@ async def call_llm(safe_messages: list, tools: list, step: int):
                 tools=tools,
                 tool_choice="auto",
                 temperature=0.0,
+                max_tokens=MAX_OUTPUT_TOKENS,
             )
-            msg = response.choices[0].message
-            history_msg = {"role": "assistant", "content": msg.content or ""}
-            normalized_calls = []
-
-            if msg.tool_calls:
-                history_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
-                    }
-                    for tc in msg.tool_calls
-                ]
-                for tc in msg.tool_calls:
-                    try:
-                        parsed = json.loads(tc.function.arguments or "{}")
-                        args = parsed if isinstance(parsed, dict) else {"_parse_error": "Tool arguments must be a JSON object."}
-                    except json.JSONDecodeError:
-                        args = {"_parse_error": f"Invalid JSON arguments: {tc.function.arguments}"}
-                    normalized_calls.append((tc.id, tc.function.name, args))
-
-            return history_msg, (msg.content or ""), normalized_calls
+            return _parse_openai_style(response)
         except APIStatusError as e:
             if e.status_code == 429 and "tokens per day" in str(e).lower():
                 print(f"  [TPD Full on {model_name}] Switching to next free Groq model...")

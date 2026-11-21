@@ -377,6 +377,8 @@ class BrowserManager:
         self._auth_cookies = []
 
     async def get_page(self, headless: bool = True):
+        if os.getenv("FORCE_HEADED", "0") == "1":
+            headless = False
         if self._context is not None and self._headless != headless:
             await self.close()
 
@@ -564,6 +566,8 @@ def is_bot_blocked(text: str) -> bool:
         return False
     low = text.lower()
     if len(text) < 350:
+        if any(w in low for w in ("bypassed", "congratulations", "success")):
+            return False
         return True
     if len(text) < 12000 and any(p in low[:6000] for p in BOT_BLOCK_PHRASES):
         return True
@@ -596,7 +600,8 @@ def is_mandatory_login_wall(text: str) -> bool:
     if total_len < 6000 and any(p in low for p in MANDATORY_LOGIN_PHRASES):
         return True
 
-    if total_len < 1200 and any(k in low for k in ("log in", "login", "sign in", "sign up", "create account", "password")):
+    if total_len < 600 and any(
+            k in low for k in ("log in", "login", "sign in", "sign up", "create account", "password")):
         return True
 
     return False

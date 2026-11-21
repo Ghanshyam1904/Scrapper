@@ -1,4 +1,16 @@
-crawl4ai 
-groq 
-langchain 
-langchain-groq
+# Core dependencies
+playwright>=1.32.0
+beautifulsoup4>=4.12.0
+groq>=3.0.0
+ollama>=0.2.0
+python-dotenv>=1.0.0
+crawl4ai>=0.1.0
+langchain>=0.1.0
+langchain-groq>=0.1.0
+requests>=2.31.0
+
+# Playwright browsers (install separately after pip install)
+# Run: playwright install chromium
+
+# Optional: for specific providers
+# openai>=1.0.0  # For FreeLLMAPI / OpenAI compatibility

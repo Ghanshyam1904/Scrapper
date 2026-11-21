@@ -7,14 +7,22 @@ SCHEMA & DATA RULES (STRICT):
 4. Extract actual, full URLs whenever links/URLs are requested.
 5. Validate all records before calling `save_to_csv`. NEVER invent, guess, or fabricate missing records or values from memory.
 6. Only use `null` for an individual missing field if the field genuinely does not exist on the page (or the user skipped mandatory login). NEVER save a row where all fields are `null` or empty.
+7. Use the EXACT column names the user asked for (e.g. 'rating', never 'rating_class' or 'star_rating').
+8. If a requested field does not exist on the page, omit that column. Never save an empty column.
+9. If two prices are joined (sale + original, e.g. "$84$120"), save price as the first and original_price as the second.
+
 
 FAST VERBATIM EXTRACTION (TABLES, JSON-LD & `extract_with_selectors`):
 1. Always call `scrape_website` on the Target URL first to inspect the content, `[HTML TABLES EXTRACTED]`, `[JSON-LD STRUCTURED DATA]`, and `[DOM Structure Sample]`.
 2. If `[HTML TABLES EXTRACTED]` or `[JSON-LD STRUCTURED DATA]` already contains the exact requested fields (e.g., Wikipedia, Worldometers, Sports stats, structured product/job details), extract directly and call `save_to_csv`.
+2b. If [HTML TABLE FOUND] appears, call save_table_rows with the column indexes from the preview. Never type table rows yourself.
 3. When `[DOM Structure Sample]` shows clear repeating item tags (`div`, `article`, `li`, `tr`, `data-testid`, `id`, `class`) and all requested fields sit on that list page, call `extract_with_selectors` (`mode='single'`, `'scroll'`, `'ajax'`, or `'url_pagination'`).
    - Use standard CSS selectors ONLY (never Playwright `:has-text(...)`). Use `selector::attr(href)` to extract link URLs.
 4. If `extract_with_selectors` returns 0 items or fails on complex/obfuscated sites, STOP guessing CSS selectors—read the page text using `scrape_website(start_char=...)`, open individual item/detail URLs from `[AGENT WORKING MEMORY]`, and call `save_to_csv` directly.
-5. When reading chunks manually, ALWAYS advance `start_char` to the next unread offset shown in `[AGENT WORKING MEMORY]`—never repeat `save_to_csv` with already-saved items.
+4b. If `extract_with_selectors` rejects columns as empty, do NOT page through the raw text. Read the page ONCE with `scrape_website` (start_char=0), then call `save_to_csv` directly with the rows from that text. Never read more than 2 chunks of the same page.
+5. When reading chunks manually, ALWAYS advance `start_char` to the next unread offset shown in `[AGENT WORKING MEMORY]`—never repeat `save_to_csv` with already-saved items. After reading EACH chunk, call save_to_csv(append=True) with the rows from that chunk before reading the next one. Never hold rows in memory across chunks.
+6. When there are more than 20 rows, call save_to_csv in batches of 15-20 rows (append=True). Never write the rows as plain text; always call the tool.
+
 
 EXTRACTION COMPLETENESS & PAGINATION RULES:
 1. Always respect the exact number of records requested.

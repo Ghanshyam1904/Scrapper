@@ -70,7 +70,11 @@ source myenv/bin/activate
 
 ```bash
 pip install -r requirements.txt
-playwright install chromium
+
+# Install Playwright browsers (required for headless/stealth scraping):
+#   playwright install chromium
+#   # Or, to install all browsers:
+#   playwright install
 ```
 
 ### 3. Configure `.env`

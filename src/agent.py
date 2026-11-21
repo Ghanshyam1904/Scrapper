@@ -1,4 +1,5 @@
 import asyncio
+import csv as _csv
 import os
 import re
 
@@ -21,6 +22,11 @@ from src.tools import (
     search_on_website,
     login_or_signup_with_email,
     save_to_csv,
+    save_table_rows,
+    shopify_products,
+    hn_front_page,
+    TABLE_ROWS,
+    JSONLD_ROWS,
 )
 
 
@@ -32,14 +38,30 @@ def _parse_append_flag(raw_val) -> bool:
     return bool(raw_val)
 
 
-async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int = 30):
+async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int = 15):
     url = url.strip().rstrip("\\")
     if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    wants_pages = bool(re.search(
+        r"\b(?:(?:all|first|last|top)\s+)?\d+\s+pages?\b|\ball\s+pages?\b",
+        user_goal, re.IGNORECASE,
+    ))
+    wants_pages = wants_pages and not re.search(
+        r"\b(?:this page only|on this page|current page|only this page)\b",
+        user_goal, re.IGNORECASE,
+    )
+    wants_all = bool(re.search(r"\ball\b", user_goal, re.IGNORECASE)) or wants_pages
+    pm = re.search(r"\b(?:first|top|last)?\s*(\d+)\s+pages?\b", user_goal, re.IGNORECASE)
+    max_pages_req = int(pm.group(1)) if pm else None
+    goal_for_count = re.sub(
+        r"\b(?:first|top|all|last)?\s*\d+\s+pages?\b", " ", user_goal, flags=re.IGNORECASE
+    )
+    pagination_complete = False
+
     count_match = re.search(
         r"\b(?:first|top|at least)\s+(\d+)\b|\b(\d+)\s+(?:countries|records|items|products|listings|mobiles?|phones?|laptops?|jobs?|books?|quotes?|articles?|reviews?|rows?|teams?|hotels?|restaurants?|places?|companies|posts?|threads?|comments?|stories|headlines?|movies?|songs?|universities|players?|matches?|tools?|software|results?|entries)\b",
-        user_goal,
+        goal_for_count,
         re.IGNORECASE,
     )
     is_nested_request = bool(re.search(r"\b(?:each|per\s+\w+|every)\b", user_goal, re.IGNORECASE))
@@ -54,9 +76,41 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
 
     csv_filename = resolve_csv_path(csv_filename)
     PAGE_CACHE.clear()
+    TABLE_ROWS.clear()
+    JSONLD_ROWS.clear()
     DOM_SAMPLE_CACHE.clear()
     seen_calls: set[tuple] = set()
     memory = WorkingMemory(url, requested_count=requested_count)
+
+    # ---- Shortcut 1: Hacker News official API ----
+    if "news.ycombinator.com" in url and "item?id" not in url:
+        rows = hn_front_page(requested_count or 30)
+        msg = save_to_csv(filename=csv_filename, items=rows, append=False, memory=memory, skip_grounding=True)
+        print(msg)
+        return {
+            "steps": 0,
+            "auth_status": "NOT REQUIRED (public page)",
+            "extraction_status": f"SUCCESS ({memory.total_saved_count} unique rows saved -> {os.path.abspath(csv_filename)})",
+            "rows_saved": memory.total_saved_count,
+            "csv_path": os.path.abspath(csv_filename),
+        }
+
+    # ---- Shortcut 2: Shopify /products.json ----
+    if ("/collections/" in url or "/products" in url) and "review" not in user_goal.lower():
+        try:
+            _sp = shopify_products(url, requested_count or 20)
+        except Exception:
+            _sp = []
+        if _sp:
+            print(save_to_csv(filename=csv_filename, items=_sp, append=False, memory=memory, skip_grounding=True))
+            return {
+                "steps": 0,
+                "auth_status": "NOT REQUIRED (public page)",
+                "extraction_status": f"SUCCESS ({memory.total_saved_count} rows via Shopify API -> {os.path.abspath(csv_filename)})",
+                "rows_saved": memory.total_saved_count,
+                "csv_path": os.path.abspath(csv_filename),
+            }
+
     system_prompt = load_system_prompt(SYSTEM_PROMPT_FILE)
     tools = build_tools()
 
@@ -75,6 +129,7 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
         f"Save extracted records into CSV file: '{csv_filename}'.\n"
         "First call scrape_website on the Target URL. "
         "If [DOM Structure Sample] shows clear repeating cards/rows, you may use extract_with_selectors. "
+        "If [HTML TABLE FOUND] appears, use save_table_rows and never type table rows yourself. "
         "On complex/obfuscated sites or when opening individual detail URLs, "
         "DO NOT keep guessing CSS selectors—read the text/tables/JSON-LD via scrape_website(start_char=...) or open exact URLs from [AGENT WORKING MEMORY] and call save_to_csv directly. "
         "NEVER invent or guess item URLs—only open URLs seen verbatim on scraped pages or in [AGENT WORKING MEMORY]. "
@@ -91,6 +146,7 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
 
     saved_csv = False
     consecutive_nudges = 0
+    pagination_nudges = 0
     dup_redirect_count = 0
     consecutive_dups = 0
     consecutive_zero_saves = 0
@@ -112,9 +168,11 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
 
             if not tool_calls:
                 incomplete = bool(
-                    requested_count
-                    and memory.total_saved_count < requested_count
-                    and not login_skipped
+                    (requested_count and memory.total_saved_count < requested_count and not login_skipped)
+                    or (
+                        wants_pages and saved_csv and not pagination_complete
+                        and not login_skipped and pagination_nudges < 1
+                    )
                 )
                 if anti_bot_hits >= 2 and not saved_csv and not memory.visited_urls:
                     print("\nAgent Final Response:\n", text_content)
@@ -141,6 +199,16 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                             f"You have not extracted or saved any data yet. Call scrape_website(url='{url}') "
                             "or search_on_website(...) to gather the requested records and save them via save_to_csv."
                         )
+                    elif wants_pages and not pagination_complete and not (
+                        requested_count and memory.total_saved_count < requested_count
+                    ):
+                        pagination_nudges += 1
+                        print(f"  [Guardrail] Pagination not confirmed complete ({memory.total_saved_count} rows); nudging once ({consecutive_nudges}/4)...")
+                        nudge_msg = (
+                            f"INCOMPLETE: {memory.total_saved_count} rows saved but pagination did not finish. "
+                            f"Call extract_with_selectors(url='{url}', mode='url_pagination') with the same selectors and headers {memory.saved_headers}. "
+                            "Do not explain, just call the tool."
+                        )
                     else:
                         if memory.pending_urls and not unread_hint:
                             next_url = memory.pending_urls[0]
@@ -152,11 +220,12 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                             )
                         else:
                             print(f"  [Guardrail] Incomplete ({memory.total_saved_count}/{requested_count} saved); prompting continuation ({consecutive_nudges}/4)...")
+                            remaining = (requested_count or 0) - memory.total_saved_count
                             nudge_msg = (
                                 f"INCOMPLETE: User requested {requested_count} unique records, "
                                 f"but only {memory.total_saved_count} are saved in CSV so far! "
                                 f"{unread_hint or f'Read unvisited URLs from [AGENT WORKING MEMORY] or scroll/paginate on {url}.'} "
-                                f"Save the remaining {requested_count - memory.total_saved_count} records using exact headers {memory.saved_headers}."
+                                f"Save the remaining {remaining} records using exact headers {memory.saved_headers}."
                             )
                     messages.append({"role": "user", "content": nudge_msg})
                     continue
@@ -188,10 +257,23 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                             main_url=url,
                             memory=memory,
                         )
+
+                        if "[STRUCTURED LIST FOUND" in str(tool_output):
+                            _rows = JSONLD_ROWS.get(req_clean, []) or JSONLD_ROWS.get(req_url.split("#")[0], [])
+                            if _rows:
+                                _limit = int(requested_count or len(_rows))
+                                tool_output = save_to_csv(
+                                    filename=csv_filename, items=_rows[:_limit],
+                                    append=bool(saved_csv), memory=memory, skip_grounding=True,
+                                )
+                                if str(tool_output).startswith("Saved "):
+                                    saved_csv = True
+
                         if "DUPLICATE CALL BLOCKED" in str(tool_output):
                             consecutive_dups += 1
                         else:
                             consecutive_dups = 0
+
                 elif fn_name == "extract_with_selectors":
                     if selector_fail_streak >= 2:
                         tool_output = (
@@ -203,9 +285,14 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                         tool_output = await extract_with_selectors(
                             url=args.get("url") or url,
                             item_selector=args.get("item_selector") or "",
+                            max_pages=max_pages_req,
                             field_selectors=args.get("field_selectors") or {},
                             filename=csv_filename,
-                            max_items=args.get("max_items") or (requested_count or 50),
+                            max_items=(
+                                int(os.getenv("MAX_ITEMS_CAP", "5000"))
+                                if wants_all
+                                else (args.get("max_items") or requested_count or 50)
+                            ),
                             mode=args.get("mode") or ("scroll" if strict_scroll_only else "single"),
                             unique_fields=args.get("unique_fields") or None,
                             append=saved_csv,
@@ -214,6 +301,9 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                             seen_calls=seen_calls,
                             memory=memory,
                         )
+                        if "[PAGINATION COMPLETE]" in str(tool_output):
+                            pagination_complete = True
+
                         if "Saved " in str(tool_output):
                             saved_csv = True
                             consecutive_zero_saves = 0
@@ -224,6 +314,7 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                             consecutive_dups += 1
                         else:
                             consecutive_dups = 0
+
                 elif fn_name == "scroll_and_scrape":
                     tool_output = await scroll_and_scrape(
                         url=args.get("url") or url,
@@ -236,6 +327,7 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                         consecutive_dups += 1
                     else:
                         consecutive_dups = 0
+
                 elif fn_name == "ajax_paginate_and_scrape":
                     tool_output = await ajax_paginate_and_scrape(
                         url=args.get("url") or url,
@@ -248,6 +340,7 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                         consecutive_dups += 1
                     else:
                         consecutive_dups = 0
+
                 elif fn_name == "search_on_website":
                     tool_output = await search_on_website(
                         url=args.get("url") or url,
@@ -262,10 +355,12 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                         consecutive_dups += 1
                     else:
                         consecutive_dups = 0
+
                 elif fn_name == "save_memory_note":
                     tool_output = memory.add_note(args.get("note") or "")
                     print(f"  [Memory Note] {args.get('note', '')[:80]}")
                     consecutive_dups = 0
+
                 elif fn_name == "login_or_signup_with_email":
                     target_login_url = (args.get("url") or url).split("#")[0]
                     cached_page = PAGE_CACHE.get(target_login_url, "")
@@ -302,8 +397,39 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                         else:
                             auth_failed = True
                         consecutive_dups = 0
+
+                elif fn_name == "save_jsonld_list":
+                    rows = JSONLD_ROWS.get((args.get("url") or url).split("#")[0], [])
+                    limit = int(args.get("max_items") or requested_count or len(rows) or 0)
+                    if not rows:
+                        tool_output = "No JSON-LD list cached for this URL."
+                    else:
+                        tool_output = save_to_csv(
+                            filename=csv_filename, items=rows[:limit], append=bool(saved_csv),
+                            memory=memory, skip_grounding=True,
+                        )
+                        if str(tool_output).startswith("Saved "):
+                            saved_csv = True
+                            consecutive_zero_saves = 0
+
+                elif fn_name == "save_table_rows":
+                    tool_output = save_table_rows(
+                        url=args.get("url") or url,
+                        columns=args.get("columns") or {},
+                        first_data_row=args.get("first_data_row") or 0,
+                        max_items=int(args.get("max_items") or requested_count or 1000),
+                        filename=csv_filename,
+                        append=bool(saved_csv),
+                        memory=memory,
+                    )
+                    if str(tool_output).startswith("Saved "):
+                        saved_csv = True
+                        pagination_complete = True  # single table, koi pagination nahi
+                        consecutive_zero_saves = 0
+                    consecutive_dups = 0
+
                 elif fn_name == "save_to_csv":
-                    append_mode = _parse_append_flag(args.get("append")) if saved_csv else False
+                    append_mode = bool(saved_csv)
                     tool_output = save_to_csv(
                         filename=csv_filename,
                         items=args.get("items", []),
@@ -331,6 +457,9 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                     tool_msg["tool_call_id"] = tc_id
                 messages.append(tool_msg)
 
+            if requested_count and memory.total_saved_count >= requested_count:
+                print(f"\n[Done] Requested {requested_count} rows saved.")
+                break
             if auth_failed:
                 print("\n[AUTH FAILED] Mandatory authentication could not be verified. Aborting without silent fallback.")
                 break
@@ -378,6 +507,20 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
     finally:
         await BROWSER_MANAGER.close(clear_auth=True)
 
+    # ---- Post-run checks ----
+    rank_note = ""
+    try:
+        with open(csv_filename, encoding="utf-8-sig", newline="") as _f:
+            _rows = list(_csv.DictReader(_f))
+        rk = [
+            int(v) for r in _rows for k, v in r.items()
+            if k and k.lower() == "rank" and str(v).strip().isdigit()
+        ]
+        if rk and requested_count and sorted(rk)[:requested_count] != list(range(1, requested_count + 1)):
+            rank_note = f" | WARNING: ranks are not 1..{requested_count} (got min={min(rk)}, max={max(rk)})"
+    except Exception:
+        pass
+
     if auth_failed:
         auth_status = "FAILED (verification failed)"
     elif auth_verified:
@@ -396,17 +539,25 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
             f"PARTIAL SUCCESS ({memory.total_saved_count}/{requested_count} unique rows saved -> "
             f"{os.path.abspath(csv_filename)})"
         )
+    elif wants_pages and not pagination_complete:
+        ext_status = (
+            f"PARTIAL ({memory.total_saved_count} rows saved; pagination NOT confirmed complete -> "
+            f"{os.path.abspath(csv_filename)})"
+        )
     else:
         ext_status = f"SUCCESS ({memory.total_saved_count} unique rows saved -> {os.path.abspath(csv_filename)})"
 
+    if rank_note and ext_status.startswith("SUCCESS"):
+        ext_status = ext_status.replace("SUCCESS", "SUSPECT", 1)
+
     print(f"\n--- Run Summary (after {step} steps) ---")
     print(f"Authentication Status : {auth_status}")
-    print(f"Extraction Status     : {ext_status}")
+    print(f"Extraction Status     : {ext_status}{rank_note}")
 
     return {
         "steps": step,
         "auth_status": auth_status,
-        "extraction_status": ext_status,
+        "extraction_status": ext_status + rank_note,
         "rows_saved": memory.total_saved_count,
         "csv_path": os.path.abspath(csv_filename),
     }

@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 from groq import Groq
 from ollama import Client as OllamaClient
+from openai import OpenAI
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -13,12 +14,15 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 
 # ---------------- ENV CONFIG ----------------
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b").strip()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b").strip()
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", os.path.join(BASE_DIR, "system_prompt.txt")).strip()
 if not os.path.isabs(SYSTEM_PROMPT_FILE):
     SYSTEM_PROMPT_FILE = os.path.join(BASE_DIR, SYSTEM_PROMPT_FILE)
 DEFAULT_LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
+# Har LLM call mein ye limit lagani hai (128000 wali error se bachne ke liye)
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "4000"))
 
 GROQ_FALLBACK_MODELS = [
     "openai/gpt-oss-120b",
@@ -26,15 +30,34 @@ GROQ_FALLBACK_MODELS = [
     "openai/gpt-oss-20b",
 ]
 
-ollama_client = OllamaClient() if LLM_PROVIDER == "ollama" else None
+# ---------------- FREELLMAPI ----------------
+FREELLM_BASE_URL = os.getenv("FREELLM_BASE_URL", "http://localhost:3001/v1").strip()
+FREELLM_MODEL = os.getenv("FREELLM_MODEL", "nemotron-3-ultra-550b").strip()
+# Pehla model fail/rate-limit ho to ye try honge
+FREELLM_FALLBACK_MODELS = list(dict.fromkeys([
+    FREELLM_MODEL,          # nemotron-3-ultra-550b
+    "gpt-oss-120b",
+    "llama-3.3-70b",
+    "command-a",
+]))
+
+# freellm fail ho to Ollama par girne ke liye uska client bhi chahiye
+ollama_client = OllamaClient() if LLM_PROVIDER in ("ollama", "freellm") else None
 groq_client = None
+freellm_client = None
+
 if LLM_PROVIDER == "groq":
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     if not groq_key or groq_key.startswith("gsk_aapki"):
         raise ValueError("GROQ_API_KEY is not set properly in the .env file!")
     groq_client = Groq(api_key=groq_key)
+elif LLM_PROVIDER == "freellm":
+    freellm_key = os.getenv("FREELLM_API_KEY", "").strip()
+    if not freellm_key:
+        raise ValueError("FREELLM_API_KEY is not set in the .env file!")
+    freellm_client = OpenAI(base_url=FREELLM_BASE_URL, api_key=freellm_key, timeout=180)
 elif LLM_PROVIDER != "ollama":
-    raise ValueError(f"Unsupported LLM_PROVIDER='{LLM_PROVIDER}'. Use 'ollama' or 'groq'.")
+    raise ValueError(f"Unsupported LLM_PROVIDER='{LLM_PROVIDER}'. Use 'ollama', 'groq' or 'freellm'.")
 
 PAGE_CACHE: dict[str, str] = {}
 DOM_SAMPLE_CACHE: dict[str, str] = {}
