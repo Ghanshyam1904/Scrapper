@@ -40,6 +40,7 @@ from src.browser import (
 _TEXT_COL_HINTS = (
     "country", "capital", "city", "state", "author", "reviewer",
     "company", "title", "job_title", "model_name", "book_title", "name",
+    "region", "continent",
 )
 _NUMERIC_COL_HINTS = (
     "population", "area", "km2", "sq_km", "price", "cost",
@@ -142,33 +143,69 @@ def html_table_rows(raw_html: str, min_rows: int = 10) -> list[list[str]]:
     return best
 
 
+def _hnorm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _num_of(v):
+    m = re.search(r"-?\d[\d,]*\.?\d*", str(v))
+    try:
+        return float(m.group(0).replace(",", "")) if m else None
+    except ValueError:
+        return None
+
+
 def save_table_rows(url, columns, first_data_row, max_items, filename, append, memory=None) -> str:
-    key = (url or "").split("#")[0]
-    t = TABLE_ROWS.get(key) or TABLE_ROWS.get(key.rstrip("/"))
-    if not t and TABLE_ROWS:
-        t = list(TABLE_ROWS.values())[-1]  # URL thoda alag likha ho to latest table
+    t = TABLE_ROWS.get((url or "").split("#")[0])
     if not t:
         return "No table cached for this URL. Call scrape_website first."
     if not isinstance(columns, dict) or not columns:
-        return "Error: columns must be {csv_column_name: column_index}."
+        return "Error: columns must be {csv_column_name: header_text_or_index}."
+
+    fdr = int(first_data_row or 0)
+    header_rows = t[:max(fdr, 1)]
+    idx_map = {}
+    for name, spec in columns.items():
+        s = str(spec).strip()
+        if s.lstrip("-").isdigit():
+            idx_map[name] = int(s)
+            continue
+        want = _hnorm(s)
+        hits = sorted({i for hr in header_rows for i, c in enumerate(hr) if want and want in _hnorm(c)})
+        if not hits:
+            heads = " || ".join(" | ".join(c[:22] for c in hr) for hr in header_rows)
+            return f"Error: no column header matches '{s}'. Headers are: {heads}. Omit this field if it is not in the table."
+        if len(hits) > 1:
+            return (f"Error: '{s}' matches several columns {hits} (different years/sources). "
+                    "Pick one and pass its integer index for this field.")
+        idx_map[name] = hits[0]
+
+    if len(set(idx_map.values())) != len(idx_map):
+        return "Error: two CSV columns point to the same table column. Map each field to a different column."
+
     rows = []
-    for r in t[int(first_data_row or 0):]:
-        item = {}
-        for name, idx in columns.items():
-            try:
-                i = int(idx)
-            except (TypeError, ValueError):
-                return f"Error: index for '{name}' must be an integer."
-            item[name] = r[i] if 0 <= i < len(r) else ""
+    for r in t[fdr:]:
+        item = {n: (r[i] if 0 <= i < len(r) else "") for n, i in idx_map.items()}
+        item = {n: re.sub(r"\s*\(\d{4}\)\s*$", "", str(v)).strip() for n, v in item.items()}
         if any(str(v).strip() for v in item.values()):
             rows.append(item)
         if len(rows) >= int(max_items):
             break
-    return save_to_csv(
-        filename=filename, items=rows, append=append, memory=memory,
-        skip_grounding=True, check_empty_cols=True,
-    )
 
+    print(f"  [save_table_rows] columns->index {idx_map} first_data_row={fdr} rows={len(rows)}")
+
+    warn = ""
+    for n in idx_map:
+        nums = [_num_of(it[n]) for it in rows]
+        nums = [x for x in nums if x is not None]
+        if len(nums) >= 8:
+            pairs = list(zip(nums, nums[1:]))
+            desc = sum(1 for a, b in pairs if a >= b)
+            if 0.8 <= desc / len(pairs) < 1.0:
+                warn = f" [WARNING: column '{n}' is almost sorted but has {len(pairs)-desc} out-of-order values; check for mixed columns]"
+                break
+
+    return save_to_csv(filename=filename, items=rows, append=append, memory=memory, skip_grounding=True) + warn
 
 def _merge_scroll_snapshots(snapshots: list[str]) -> str:
     """Preserve items seen across virtualized scroll steps without duplicate blocks."""
@@ -430,6 +467,17 @@ async def scrape_website(
             JSONLD_ROWS[cache_url] = jsonld_itemlist_rows(raw_html) or next_data_rows(raw_html)
             print(f"  [JSON-LD Rows] {len(JSONLD_ROWS[cache_url])} rows found")
 
+        if raw_html:
+            tbl_rows = html_table_rows(raw_html)
+            print(f"  [Tables] largest table has {len(tbl_rows)} rows")
+            if len(tbl_rows) >= 15:
+                TABLE_ROWS[cache_url] = tbl_rows
+                _prev = "\n".join(f"{i}: " + " | ".join(c[:26] for c in r) for i, r in enumerate(tbl_rows[:6]))
+                cleaned = (
+                    f"[HTML TABLE FOUND: {len(tbl_rows)} rows on '{cache_url}'. First rows (row_index: col0 | col1 | ...):\n{_prev}\n"
+                    "Call save_table_rows(url, columns={csv_name: col_index}, first_data_row=<first real data row index>, max_items=N). "
+                    "Code copies values verbatim. Do NOT type the rows yourself. Map only columns that exist in the table.]\n" + cleaned
+                )
         PAGE_CACHE[cache_url] = cleaned
         preview = cleaned[:160].replace("\n", " ")
         print(f"  [Page Preview] {preview}...")
@@ -994,6 +1042,11 @@ async def extract_with_selectors(
                     attrMode = attrMatch[2].trim();
                 }
                 let scope = card;
+                                let countMode = false;
+                if (cssSel.startsWith('COUNT::')) {
+                    cssSel = cssSel.slice(7).trim();
+                    countMode = true;
+                }
                 if (cssSel.startsWith('NEXT::')) {
                     cssSel = cssSel.slice(6).trim();
                     scope = card.nextElementSibling || card;
@@ -1003,6 +1056,10 @@ async def extract_with_selectors(
                     els = cssSel ? Array.from(scope.querySelectorAll(cssSel)) : [scope];
                 } catch (err) {
                     return { __error: `Invalid field_selector '${cssSel}' for '${col}': ${err.message}` };
+                }
+                if (countMode) {
+                    obj[col] = String(els.length);
+                    continue;
                 }
                 if (!els.length) {
                     obj[col] = '';
@@ -1092,6 +1149,7 @@ async def extract_with_selectors(
 
     res = await page.evaluate(js_extract, {"rootSelector": item_selector, "fieldsMap": field_selectors})
     if isinstance(res, dict) and res.get("__error"):
+        print(f"  [Selector Error] {res['__error']}")
         return (
             f"SELECTOR FAILED: {res['__error']}. Use standard CSS selectors only (never :has-text). "
             "Check [DOM Structure Sample] or fall back to scrape_website + save_to_csv."
@@ -1099,6 +1157,7 @@ async def extract_with_selectors(
     initial_batch = res.get("rows", []) if isinstance(res, dict) else []
     for r in initial_batch:
         if isinstance(r, dict) and r.get("__error"):
+            print(f"  [Selector Error] {r['__error']}")
             return (
                 f"SELECTOR FAILED: {r['__error']}. Use standard CSS selectors only (never :has-text). "
                 "Check [DOM Structure Sample] or fall back to scrape_website + save_to_csv."
@@ -1398,8 +1457,13 @@ async def search_on_website(
         for sel in sels:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=500):
-                    return loc
+                if not await loc.is_visible(timeout=500):
+                    continue
+                itype = (await loc.get_attribute("type") or "text").lower()
+                if itype in ("checkbox", "radio", "button", "submit", "hidden", "file", "image"):
+                    continue
+                await loc.scroll_into_view_if_needed(timeout=1500)
+                return loc
             except Exception:
                 pass
         return None
@@ -1424,10 +1488,14 @@ async def search_on_website(
                 pass
 
     if not search_box:
+
         return f"Could not locate a visible search bar on '{url}'. Read '{url}' directly or open a category/search URL."
 
     before_url = page.url
-    await search_box.click()
+    try:
+        await search_box.click(timeout=5000)
+    except Exception as e:
+        return f"Search box found but not clickable ({type(e).__name__}). This page likely uses a form, not a search bar. Read the page directly instead."
     await search_box.fill("")
     await search_box.type(query, delay=65)
     await page.wait_for_timeout(600)
@@ -1801,7 +1869,7 @@ def _is_placeholder(val) -> bool:
     if val is None:
         return True
     v = str(val).strip().lower()
-    if v in {"", "n/a", "na", "none", "unknown", "null", "-"}:
+    if v in {"", "n/a", "na", "none", "unknown", "null", "-", "—", "–"}:
         return True
     blocked_phrases = (
         "not publicly visible",
@@ -1882,17 +1950,27 @@ def _check_grounding(items: list[dict]) -> str | None:
     return None
 
 
+_INTEGRITY_EXEMPT = (
+    "year", "rating", "status", "view", "like", "subscriber", "follower",
+    "vote", "count", "comment", "stock", "quantity", "age", "duration",
+    "wins", "losses", "score", "points",
+)
+
+
 def _check_row_integrity(items: list[dict]) -> str | None:
-    # Same numeric value har row mein copy-paste to nahi hui
+    """Sirf bade batch par: ek hi value 70%+ rows mein copy-paste to nahi."""
+    if len(items) < 8:
+        return None
     for col in {k for it in items for k in it}:
+        if any(h in col.lower() for h in _INTEGRITY_EXEMPT):
+            continue
         vals = [str(it.get(col, "")).strip() for it in items if it.get(col) not in (None, "")]
-        if len(vals) >= 5 and any(ch.isdigit() for ch in vals[0]):
+        if len(vals) >= 8 and any(ch.isdigit() for ch in vals[0]):
             top = max(set(vals), key=vals.count)
-            if vals.count(top) / len(vals) >= 0.5 and not any(k in col.lower() for k in ("year", "rating", "status")):
+            if vals.count(top) / len(vals) >= 0.7:
                 return (f"REJECTED (suspicious data): column '{col}' has the same value '{top}' "
                         f"in {vals.count(top)} of {len(vals)} rows. This looks copy-pasted, not scraped.")
     return None
-
 
 def _row_val(row: dict, k: str) -> str:
     if k in row:
@@ -1958,6 +2036,16 @@ def _normalize_ratings(items: list[dict]) -> list[dict]:
                     it[k] = _WORD_NUM[m.group(1)]
     return items
 
+def _clean_numbers(items: list[dict]) -> list[dict]:
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        for k, v in list(it.items()):
+            if any(h in str(k).lower() for h in ("gdp", "population", "market_cap", "revenue")):
+                s = str(v).strip()
+                if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
+                    it[k] = float(s.replace(",", "")) if "." in s else int(s.replace(",", ""))
+    return items
 
 def _split_prices(items: list[dict]) -> list[dict]:
     """'$84$120' -> price=84, original_price=120."""
@@ -2138,6 +2226,7 @@ def save_to_csv(
     if not items or not isinstance(items, list):
         return "Error: items must be a non-empty list of objects."
     items = _normalize_ratings(items)
+    items = _clean_numbers(items)
     items = _split_prices(items)
 
     for item in items:
@@ -2166,13 +2255,18 @@ def save_to_csv(
         )
 
     # Khali column guard: sirf model-typed rows aur table rows par (JSON-LD/HN/CMC par nahi)
-    if (not skip_grounding or check_empty_cols) and len(valid_items) >= 3:
-        _all_cols = {k for it in valid_items for k in it}
-        _dead = [c for c in _all_cols if all(_is_placeholder(it.get(c)) for it in valid_items)]
-        if _dead:
+    # Khali column guard: sirf model-typed rows par (skip_grounding=True wale trusted paths par nahi)
+    if not skip_grounding:
+        all_cols = {k for it in valid_items for k in it}
+        sparse = [
+            c for c in all_cols
+            if sum(1 for it in valid_items if _is_placeholder(it.get(c))) >= 0.8 * len(valid_items)
+        ]
+        if sparse and len(valid_items) >= 5:
             return (
-                f"REJECTED: columns {_dead} are empty in every row. Either find real values for them "
-                "or omit those columns. Do not save empty columns."
+                f"REJECTED: columns {sparse} are empty in 80%+ rows. Find real values for them "
+                "(check data-* attributes in [DOM Structure Sample], or use the COUNT:: / ::attr() selector syntax), "
+                "or omit those columns."
             )
 
     sem_error = _validate_semantic_mapping(valid_items)
@@ -2312,3 +2406,20 @@ def hn_front_page(limit: int = 30) -> list[dict]:
         }
         for n, it in enumerate(items, 1)
     ]
+def youtube_search(query: str, limit: int = 6) -> list[dict]:
+    """yt-dlp se YouTube search: title, channel, views, subscribers (bina browser/LLM)."""
+    import yt_dlp
+    opts = {"quiet": True, "skip_download": True, "noprogress": True, "no_warnings": True}
+    with yt_dlp.YoutubeDL(opts) as y:
+        r = y.extract_info(f"ytsearch{int(limit)}:{query}", download=False)
+    rows = []
+    for e in (r or {}).get("entries", []) or []:
+        if not e:
+            continue
+        rows.append({
+            "video_name": e.get("title"),
+            "channel_name": e.get("channel") or e.get("uploader"),
+            "views": e.get("view_count"),
+            "subscriber": e.get("channel_follower_count"),
+        })
+    return rows

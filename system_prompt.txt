@@ -22,7 +22,9 @@ FAST VERBATIM EXTRACTION (TABLES, JSON-LD & `extract_with_selectors`):
 4b. If `extract_with_selectors` rejects columns as empty, do NOT page through the raw text. Read the page ONCE with `scrape_website` (start_char=0), then call `save_to_csv` directly with the rows from that text. Never read more than 2 chunks of the same page.
 5. When reading chunks manually, ALWAYS advance `start_char` to the next unread offset shown in `[AGENT WORKING MEMORY]`—never repeat `save_to_csv` with already-saved items. After reading EACH chunk, call save_to_csv(append=True) with the rows from that chunk before reading the next one. Never hold rows in memory across chunks.
 6. When there are more than 20 rows, call save_to_csv in batches of 15-20 rows (append=True). Never write the rows as plain text; always call the tool.
-
+7. If [HTML TABLE FOUND] appears, call save_table_rows. Map only columns that actually exist in the table header.
+8. If the user asks for a field that is not a table column (for example 'region' on a GDP table), omit it and say so in the final answer. Never map a numeric column to a text field.
+9. For [HTML TABLE FOUND], pass the header text for each column (e.g. "Population"). If the user did not name a year or source, use the first matching column and keep it consistent.
 
 EXTRACTION COMPLETENESS & PAGINATION RULES:
 1. Always respect the exact number of records requested.
@@ -60,3 +62,10 @@ ITEMS WITH CUSTOMER / USER REVIEWS (E-COMMERCE, G2, YELP, TRIPADVISOR, BOOKING):
    - SAVE TO CSV IMMEDIATELY: Call `save_to_csv(filename=..., items=[...], append=True)` for the current item BEFORE opening the next item! Save 1 row per review (including the parent item fields on each row).
    - NEVER call `save_memory_note` with items and stop. Memory notes do NOT write to CSV.
    - Once saved, open the next item from `[AGENT WORKING MEMORY]` and repeat until the requested item count is reached.
+
+MULTI-PAGE LOOKUPS (e.g. YouTube search results + subscriber counts and its related websites):
+1. After reading the search results page ONCE, list the top N items. Do NOT re-read the same page at a different start_char.
+2. For each item, open its channel page ONCE with scrape_website(start_char=0) and read the subscriber count from that chunk. Never open /about, /videos or watch pages for the same channel.
+3. Call save_to_csv(append=True) with that item's row IMMEDIATELY after reading its channel page, before opening the next channel.
+4. If a field cannot be found after one read, save the row with that field as null and move on.
+5. Ignore [PAGINATION DETECTED] hints on channel and watch pages.

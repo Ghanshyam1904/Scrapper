@@ -236,7 +236,8 @@ def extract_dom_sample(raw_html: str) -> str:
             clone = BeautifulSoup(str(sample), "html.parser")
             for el in clone.find_all(True):
                 kept = {}
-                for attr in ("id", "class", "data-testid", "data-component-type", "itemprop", "role"):
+                for attr in ("id", "class", "data-testid", "data-component-type", "itemprop", "role",
+                             "data-rating", "data-count", "data-score", "data-value", "aria-label"):
                     if el.get(attr):
                         kept[attr] = el.get(attr)
                 if el.get("title"):

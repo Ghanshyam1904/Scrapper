@@ -37,8 +37,7 @@ def build_tools() -> list[dict]:
                     "type": "object",
                     "properties": {
                         "url": {"type": "string"},
-                        "columns": {"type": "object",
-                                    "description": "csv column name -> column index shown in the preview"},
+                        "columns": {"type": "object", "description": "csv column name -> EXACT header text from the table (preferred) or integer column index. If a header matches several columns, use the index."},
                         "first_data_row": {"type": "integer",
                                            "description": "row_index of the first data row (skip header rows)"},
                         "max_items": {"type": "integer"},
@@ -89,6 +88,8 @@ def build_tools() -> list[dict]:
                     "FASTEST tool for repeating lists/cards/rows when you know exact CSS selectors from [DOM Structure Sample]. "
                     "Use standard CSS selectors only (no :has-text). Supports ::attr(href) syntax. "
                     "If selectors are obfuscated or fail twice, use scrape_website + save_to_csv instead."
+                    "Selector prefixes: 'NEXT::sel' reads from the next sibling row; 'COUNT::sel'."
+                    "returns how many elements match (use for star icons); 'sel::attr(data-rating)' reads an attribute."
                 ),
                 "parameters": {
                     "type": "object",

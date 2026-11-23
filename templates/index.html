@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Universal AI Web Scraping Agent</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #22c55e;
+      --danger: #ef4444;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .container {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px 16px 48px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    h1 { margin: 0; font-size: 1.5rem; }
+    .badge {
+      background: #0b1220;
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    .badge strong { color: var(--text); }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1.15fr;
+      gap: 20px;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+    }
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 1.05rem;
+      color: #e2e8f0;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input, textarea {
+      width: 100%;
+      background: #0f172a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.95rem;
+      margin-bottom: 14px;
+      font-family: inherit;
+    }
+    input:focus, textarea:focus {
+      outline: 2px solid var(--accent);
+      border-color: transparent;
+    }
+    .row-2 {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 12px;
+    }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: var(--accent-hover); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .btn-sm { padding: 6px 12px; font-size: 0.82rem; }
+    .btn-secondary { background: #334155; }
+    .btn-secondary:hover:not(:disabled) { background: #475569; }
+    .btn-danger { background: #991b1b; }
+    .btn-danger:hover:not(:disabled) { background: var(--danger); }
+
+    .logs {
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      height: 310px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .status-pill {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .status-idle { background: #334155; color: #cbd5e1; }
+    .status-running { background: #1d4ed8; color: #dbeafe; }
+    .status-completed { background: #166534; color: #dcfce7; }
+    .status-failed { background: #991b1b; color: #fee2e2; }
+
+    .prompt-box {
+      display: none;
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid var(--warn);
+      background: rgba(245, 158, 11, 0.1);
+      border-radius: 8px;
+    }
+    .summary {
+      display: none;
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      background: #0f172a;
+      border-radius: 8px;
+      font-size: 0.88rem;
+    }
+    .files-section { margin-top: 20px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      max-width: 300px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    .table-wrap {
+      overflow-x: auto;
+      max-height: 380px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-top: 12px;
+    }
+    .actions { display: flex; gap: 6px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Universal AI Web Scraping Agent</h1>
+      <div class="badge">
+        Provider: <strong>{{ llm_provider }}</strong> &bull; Model: <strong>{{ active_model }}</strong>
+      </div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <h2>New Scraping Task</h2>
+        <form id="scrapeForm">
+          <label for="url">Target Website URL</label>
+          <input id="url" type="text" placeholder="https://quotes.toscrape.com/" required />
+
+          <label for="userGoal">What do you want to extract?</label>
+          <textarea id="userGoal" rows="4" placeholder="Extract first 30 quotes with quote, author, and tags" required></textarea>
+
+          <div class="row-2">
+            <div>
+              <label for="csvFilename">Output CSV Filename (saved in data/)</label>
+              <input id="csvFilename" type="text" value="output.csv" />
+            </div>
+            <div>
+              <label for="maxSteps">Max Steps</label>
+              <input id="maxSteps" type="number" min="1" max="100" value="40" />
+            </div>
+          </div>
+
+          <button id="startBtn" type="submit">Start Scraping</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h2 style="margin:0;">Live Execution Logs</h2>
+          <span id="statusPill" class="status-pill status-idle">Idle</span>
+        </div>
+
+        <div id="logs" class="logs">Waiting to start a job...</div>
+
+        <div id="promptBox" class="prompt-box">
+          <div id="promptMessage" style="font-size:0.88rem; margin-bottom:8px;"></div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <input id="promptReply" type="text" placeholder="Optional email (or click Open Browser)" style="margin:0; flex:1; min-width:180px;" />
+            <button id="sendPromptBtn" type="button" class="btn-sm">Submit Email</button>
+            <button id="manualLoginBtn" type="button" class="btn-sm btn-secondary">Open Browser (Manual)</button>
+            <button id="skipLoginBtn" type="button" class="btn-sm btn-danger">Skip</button>
+          </div>
+        </div>
+
+        <div id="summaryBox" class="summary"></div>
+      </div>
+    </div>
+
+    <div class="card files-section">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2 style="margin:0;">Saved CSV Files (data/)</h2>
+        <button type="button" class="btn-sm btn-secondary" onclick="loadFiles()">Refresh</button>
+      </div>
+      <div class="table-wrap" style="max-height:240px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Filename</th>
+              <th>Rows</th>
+              <th>Size</th>
+              <th>Modified</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="filesBody"></tbody>
+        </table>
+      </div>
+
+      <div id="previewContainer" style="display:none; margin-top:18px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h2 id="previewTitle" style="margin:0;">CSV Preview</h2>
+          <button type="button" class="btn-sm btn-secondary" onclick="document.getElementById('previewContainer').style.display='none'">Close</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead id="previewHead"></thead>
+            <tbody id="previewBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentJobId = null;
+    let nextLogIndex = 0;
+    let pollTimer = null;
+
+    function setStatus(status) {
+      const pill = document.getElementById("statusPill");
+      pill.className = "status-pill status-" + status;
+      pill.textContent = status;
+    }
+
+    function escapeHtml(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    document.getElementById("scrapeForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const startBtn = document.getElementById("startBtn");
+      const logsEl = document.getElementById("logs");
+      const summaryEl = document.getElementById("summaryBox");
+      const promptBox = document.getElementById("promptBox");
+
+      startBtn.disabled = true;
+      summaryEl.style.display = "none";
+      promptBox.style.display = "none";
+      logsEl.textContent = "";
+      nextLogIndex = 0;
+      setStatus("running");
+
+      const payload = {
+        url: document.getElementById("url").value.trim(),
+        user_goal: document.getElementById("userGoal").value.trim(),
+        csv_filename: document.getElementById("csvFilename").value.trim() || "output.csv",
+        max_steps: Number(document.getElementById("maxSteps").value || 40),
+      };
+
+      try {
+        const res = await fetch("/api/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          logsEl.textContent = "Error: " + (data.error || "Failed to start job");
+          setStatus("failed");
+          startBtn.disabled = false;
+          return;
+        }
+        currentJobId = data.job_id;
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(pollJob, 1000);
+        pollJob();
+      } catch (err) {
+        logsEl.textContent = "Request error: " + err.message;
+        setStatus("failed");
+        startBtn.disabled = false;
+      }
+    });
+
+    async function pollJob() {
+      if (!currentJobId) return;
+      try {
+        const res = await fetch(`/api/jobs/${currentJobId}?after=${nextLogIndex}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const logsEl = document.getElementById("logs");
+        if (data.logs && data.logs.length) {
+          logsEl.textContent += (logsEl.textContent ? "\n" : "") + data.logs.join("\n");
+          logsEl.scrollTop = logsEl.scrollHeight;
+        }
+        nextLogIndex = data.next_index;
+
+        const promptBox = document.getElementById("promptBox");
+        if (data.pending_input) {
+          document.getElementById("promptMessage").textContent = data.pending_input;
+          promptBox.style.display = "block";
+        } else {
+          promptBox.style.display = "none";
+        }
+
+        if (data.status === "completed" || data.status === "failed") {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          setStatus(data.status);
+          document.getElementById("startBtn").disabled = false;
+
+          const summaryEl = document.getElementById("summaryBox");
+          if (data.result) {
+            summaryEl.innerHTML = `
+              <div><strong>Extraction:</strong> ${escapeHtml(data.result.extraction_status)}</div>
+              <div><strong>Auth:</strong> ${escapeHtml(data.result.auth_status)}</div>
+              <div><strong>Steps:</strong> ${escapeHtml(data.result.steps)} &bull; <strong>Rows Saved:</strong> ${escapeHtml(data.result.rows_saved)} &bull; <strong>Time:</strong> ${escapeHtml(data.elapsed_seconds)}s</div>
+              <div style="margin-top:8px;">
+                <button type="button" class="btn-sm" onclick="previewFile('${escapeHtml(data.csv_filename)}')">Preview CSV</button>
+                <a href="/api/files/${encodeURIComponent(data.csv_filename)}/download"><button type="button" class="btn-sm btn-secondary">Download CSV</button></a>
+              </div>
+            `;
+          } else {
+            summaryEl.innerHTML = `<div><strong>Error:</strong> ${escapeHtml(data.error)}</div>`;
+          }
+          summaryEl.style.display = "block";
+          loadFiles();
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function sendInputReply(value) {
+      if (!currentJobId) return;
+      await fetch(`/api/jobs/${currentJobId}/input`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value }),
+      });
+      document.getElementById("promptReply").value = "";
+      document.getElementById("promptBox").style.display = "none";
+    }
+
+    document.getElementById("sendPromptBtn").addEventListener("click", () => {
+      sendInputReply(document.getElementById("promptReply").value);
+    });
+    document.getElementById("manualLoginBtn").addEventListener("click", () => {
+      sendInputReply("");
+    });
+    document.getElementById("skipLoginBtn").addEventListener("click", () => {
+      sendInputReply("skip");
+    });
+    document.getElementById("promptReply").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        sendInputReply(document.getElementById("promptReply").value);
+      }
+    });
+
+    async function loadFiles() {
+      const res = await fetch("/api/files");
+      const data = await res.json();
+      const tbody = document.getElementById("filesBody");
+      if (!data.files.length) {
+        tbody.innerHTML = `<tr><td colspan="5" style="color:var(--muted);">No CSV files in data/ yet.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = data.files.map((f) => `
+        <tr>
+          <td>${escapeHtml(f.name)}</td>
+          <td>${f.rows}</td>
+          <td>${f.size_kb} KB</td>
+          <td>${escapeHtml(f.modified)}</td>
+          <td class="actions">
+            <button type="button" class="btn-sm" onclick="previewFile('${escapeHtml(f.name)}')">Preview</button>
+            <a href="/api/files/${encodeURIComponent(f.name)}/download"><button type="button" class="btn-sm btn-secondary">Download</button></a>
+            <button type="button" class="btn-sm btn-danger" onclick="deleteFile('${escapeHtml(f.name)}')">Delete</button>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    async function previewFile(name) {
+      const res = await fetch(`/api/files/${encodeURIComponent(name)}/preview?limit=100`);
+      const data = await res.json();
+      if (!res.ok) return alert(data.error || "Could not preview file.");
+
+      document.getElementById("previewTitle").textContent = `Preview: ${data.name} (showing ${data.showing} of ${data.total_rows} rows)`;
+      document.getElementById("previewHead").innerHTML =
+        "<tr>" + data.headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("") + "</tr>";
+      document.getElementById("previewBody").innerHTML = data.rows
+        .map((r) => "<tr>" + r.map((c) => `<td title="${escapeHtml(c)}">${escapeHtml(c)}</td>`).join("") + "</tr>")
+        .join("");
+      document.getElementById("previewContainer").style.display = "block";
+    }
+
+    async function deleteFile(name) {
+      if (!confirm(`Delete ${name}?`)) return;
+      await fetch(`/api/files/${encodeURIComponent(name)}`, { method: "DELETE" });
+      loadFiles();
+    }
+
+    loadFiles();
+  </script>
+</body>
+</html>

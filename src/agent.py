@@ -27,6 +27,7 @@ from src.tools import (
     hn_front_page,
     TABLE_ROWS,
     JSONLD_ROWS,
+    youtube_search,
 )
 
 
@@ -38,7 +39,7 @@ def _parse_append_flag(raw_val) -> bool:
     return bool(raw_val)
 
 
-async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int = 15):
+async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int = 20):
     url = url.strip().rstrip("\\")
     if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -95,20 +96,46 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
             "csv_path": os.path.abspath(csv_filename),
         }
 
-    # ---- Shortcut 2: Shopify /products.json ----
-    if ("/collections/" in url or "/products" in url) and "review" not in user_goal.lower():
+    # ---- Shortcut 3: YouTube search via yt-dlp ----
+    if "youtube.com" in url and "search" in user_goal.lower():
+        _q = re.search(
+            r"search(?:\s+for)?\s+(.+?)\s+(?:and|&|then)\s+(?:scrap\w*|extract|fetch|get|collect)",
+            user_goal, re.IGNORECASE,
+        )
+        if _q:
+            try:
+                _yt = await asyncio.to_thread(youtube_search, _q.group(1).strip(" '\""), requested_count or 6)
+            except Exception as e:
+                print(f"  [YouTube shortcut failed] {e}")
+                _yt = []
+            print(f"  [YouTube shortcut] {len(_yt)} videos for query '{_q.group(1).strip()}'")
+            if _yt:
+                _low = user_goal.lower()
+                _keep = ["video_name"]
+                if "channel" in _low: _keep.append("channel_name")
+                if "view" in _low: _keep.append("views")
+                if "subscriber" in _low: _keep.append("subscriber")
+                _yt = [{k: r[k] for k in _keep} for r in _yt]
+                print(save_to_csv(filename=csv_filename, items=_yt, append=False, memory=memory, skip_grounding=True))
+                return {
+                    "steps": 0, "auth_status": "NOT REQUIRED (public page)",
+                    "extraction_status": f"SUCCESS ({memory.total_saved_count} rows via yt-dlp -> {os.path.abspath(csv_filename)})",
+                    "rows_saved": memory.total_saved_count, "csv_path": os.path.abspath(csv_filename),
+                }
+
+    if "/collections/" in url or "/products" in url:
         try:
             _sp = shopify_products(url, requested_count or 20)
-        except Exception:
+        except Exception as e:
+            print(f"  [Shopify shortcut failed] {e}")
             _sp = []
+        print(f"  [Shopify shortcut] {len(_sp)} products")
         if _sp:
             print(save_to_csv(filename=csv_filename, items=_sp, append=False, memory=memory, skip_grounding=True))
             return {
-                "steps": 0,
-                "auth_status": "NOT REQUIRED (public page)",
+                "steps": 0, "auth_status": "NOT REQUIRED (public page)",
                 "extraction_status": f"SUCCESS ({memory.total_saved_count} rows via Shopify API -> {os.path.abspath(csv_filename)})",
-                "rows_saved": memory.total_saved_count,
-                "csv_path": os.path.abspath(csv_filename),
+                "rows_saved": memory.total_saved_count, "csv_path": os.path.abspath(csv_filename),
             }
 
     system_prompt = load_system_prompt(SYSTEM_PROMPT_FILE)
@@ -162,6 +189,15 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
     try:
         for step in range(1, max_steps + 1):
             print(f"\n--- Agent Step {step} ({get_active_model()}) ---")
+            if not saved_csv and step == max_steps - 6:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "STEP BUDGET: only 6 steps left and nothing is saved yet. Call save_to_csv NOW with "
+                        "everything found so far. Omit any column whose value you could not find "
+                        "(do not invent values). Do not open more pages."
+                    ),
+                })
             safe_messages = trim_messages(messages, memory=memory)
             history_msg, text_content, tool_calls = await call_llm(safe_messages, tools, step)
             messages.append(history_msg)
@@ -249,6 +285,20 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                         )
                         consecutive_dups += 1
                     else:
+                        _seen_text = " ".join(PAGE_CACHE.values())
+                        _known = (
+                                req_clean == target_cache_url
+                                or req_clean in memory.visited_urls
+                                or req_clean in _seen_text
+                        )
+                        if not _known:
+                            tool_output = (
+                                f"BLOCKED: '{req_url}' was not seen on any scraped page. "
+                                "Only open URLs that appeared verbatim in scraped text or [AGENT WORKING MEMORY]."
+                            )
+                            consecutive_dups += 1
+                            messages.append({"role": "tool", "tool_call_id": tc_id, "content": str(tool_output)})
+                            continue
                         tool_output = await scrape_website(
                             url=req_url,
                             start_char=args.get("start_char") or 0,
@@ -260,7 +310,9 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
 
                         if "[STRUCTURED LIST FOUND" in str(tool_output):
                             _rows = JSONLD_ROWS.get(req_clean, []) or JSONLD_ROWS.get(req_url.split("#")[0], [])
-                            if _rows:
+                            _need = requested_count or 10
+                            if _rows and len(_rows) >= min(_need, 10) and (
+                                    not requested_count or len(_rows) >= requested_count):
                                 _limit = int(requested_count or len(_rows))
                                 tool_output = save_to_csv(
                                     filename=csv_filename, items=_rows[:_limit],
@@ -268,11 +320,11 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                                 )
                                 if str(tool_output).startswith("Saved "):
                                     saved_csv = True
-
-                        if "DUPLICATE CALL BLOCKED" in str(tool_output):
-                            consecutive_dups += 1
-                        else:
-                            consecutive_dups = 0
+                            else:
+                                tool_output = (
+                                    f"[Note: a small JSON-LD list ({len(_rows)} items) exists but does not cover the request; "
+                                    "ignore it and extract from the page content.]"
+                                )
 
                 elif fn_name == "extract_with_selectors":
                     if selector_fail_streak >= 2:
@@ -341,17 +393,21 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
                     else:
                         consecutive_dups = 0
 
+
                 elif fn_name == "search_on_website":
-                    tool_output = await search_on_website(
-                        url=args.get("url") or url,
-                        query=args.get("query") or "",
-                        location=args.get("location") or "",
-                        section=args.get("section") or "",
-                        filters=args.get("filters") or None,
-                        seen_calls=seen_calls,
-                        memory=memory,
-                    )
-                    if "DUPLICATE SEARCH BLOCKED" in str(tool_output):
+                    try:
+                        tool_output = await search_on_website(
+                            url = args.get("url") or url,
+                            query=args.get("query") or "",
+                            location=args.get("location") or "",
+                            section=args.get("section") or "",
+                            filters=args.get("filters") or None,
+                            seen_calls=seen_calls,
+                            memory=memory,
+                        )
+                    except Exception as e:
+                        tool_output =  f"TOOL ERROR in search_on_website: {type(e).__name__}: {str(e)[:200]}. Try a different approach."
+                    if "DUPLICATE SEARCH BLOCKED" in str(tool_output) or str(tool_output).startswith("TOOL ERROR"):
                         consecutive_dups += 1
                     else:
                         consecutive_dups = 0
@@ -509,6 +565,7 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
 
     # ---- Post-run checks ----
     rank_note = ""
+    blank_note = ""
     try:
         with open(csv_filename, encoding="utf-8-sig", newline="") as _f:
             _rows = list(_csv.DictReader(_f))
@@ -518,6 +575,13 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
         ]
         if rk and requested_count and sorted(rk)[:requested_count] != list(range(1, requested_count + 1)):
             rank_note = f" | WARNING: ranks are not 1..{requested_count} (got min={min(rk)}, max={max(rk)})"
+        if _rows:
+            _bad = [
+                c for c in _rows[0].keys()
+                if c and sum(1 for r in _rows if not str(r.get(c, "")).strip()) >= 0.5 * len(_rows)
+            ]
+            if _bad:
+                blank_note = f" | WARNING: columns mostly empty: {_bad}"
     except Exception:
         pass
 
@@ -547,17 +611,18 @@ async def run_agent(url: str, user_goal: str, csv_filename: str, max_steps: int 
     else:
         ext_status = f"SUCCESS ({memory.total_saved_count} unique rows saved -> {os.path.abspath(csv_filename)})"
 
-    if rank_note and ext_status.startswith("SUCCESS"):
+    notes = rank_note + blank_note
+    if notes and ext_status.startswith("SUCCESS"):
         ext_status = ext_status.replace("SUCCESS", "SUSPECT", 1)
 
     print(f"\n--- Run Summary (after {step} steps) ---")
     print(f"Authentication Status : {auth_status}")
-    print(f"Extraction Status     : {ext_status}{rank_note}")
+    print(f"Extraction Status     : {ext_status}{notes}")
 
     return {
         "steps": step,
         "auth_status": auth_status,
-        "extraction_status": ext_status + rank_note,
+        "extraction_status": ext_status + notes,
         "rows_saved": memory.total_saved_count,
         "csv_path": os.path.abspath(csv_filename),
     }
