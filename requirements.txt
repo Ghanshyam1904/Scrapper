@@ -8,6 +8,7 @@ crawl4ai>=0.1.0
 langchain>=0.1.0
 langchain-groq>=0.1.0
 requests>=2.31.0
+yt-dlp
 
 # Playwright browsers (install separately after pip install)
 # Run: playwright install chromium

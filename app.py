@@ -21,6 +21,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 _ACTIVE_JOB_LOCK = threading.Lock()
 _JOBS_LOCK = threading.Lock()
 _JOBS: dict[str, dict] = {}
+_ABORT_SENTINEL = object()
 
 
 def _safe_csv_filename(raw_name: str) -> str:
@@ -75,27 +76,40 @@ def _run_job_thread(job_id: str, url: str, user_goal: str, csv_filename: str, ma
     tid = threading.get_ident()
     orig_stdout = sys.stdout
     orig_input = builtins.input
-    input_queue: queue.Queue[str] = queue.Queue()
+    input_queue: queue.Queue[object] = queue.Queue()
+    cancel_event = threading.Event()
 
     def _web_input(prompt: str = "") -> str:
+        if cancel_event.is_set():
+            raise asyncio.CancelledError("Job aborted by user.")
+
         clean_prompt = (prompt or "Input required by agent:").strip()
         with _JOBS_LOCK:
             job["logs"].append(f"[INPUT REQUIRED] {clean_prompt}")
             job["pending_input"] = clean_prompt
             job["input_queue"] = input_queue
-        reply = input_queue.get()  # Blocks until user submits via /api/jobs/<id>/input
+
+        reply = input_queue.get()  # Blocks until user submits or aborts
+
         with _JOBS_LOCK:
             job["pending_input"] = None
             job["input_queue"] = None
+
+        if reply is _ABORT_SENTINEL or cancel_event.is_set():
+            raise asyncio.CancelledError("Job aborted by user.")
+
+        with _JOBS_LOCK:
             job["logs"].append("[INPUT RECEIVED] Resuming agent...")
-        return reply
+        return str(reply)
 
     start_perf = time.perf_counter()
+    loop = asyncio.new_event_loop()
     try:
         sys.stdout = _ThreadScopedStdout(tid, job, orig_stdout)
         builtins.input = _web_input
+        asyncio.set_event_loop(loop)
 
-        result = asyncio.run(
+        task = loop.create_task(
             run_agent(
                 url=url,
                 user_goal=user_goal,
@@ -103,12 +117,32 @@ def _run_job_thread(job_id: str, url: str, user_goal: str, csv_filename: str, ma
                 max_steps=max_steps,
             )
         )
+
+        with _JOBS_LOCK:
+            job["loop"] = loop
+            job["task"] = task
+            job["cancel_event"] = cancel_event
+            if job.get("abort_requested"):
+                cancel_event.set()
+                task.cancel()
+
+        result = loop.run_until_complete(task)
         elapsed = round(time.perf_counter() - start_perf, 2)
         with _JOBS_LOCK:
             job["status"] = "completed"
             job["result"] = result
             job["elapsed_seconds"] = elapsed
             job["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    except asyncio.CancelledError:
+        elapsed = round(time.perf_counter() - start_perf, 2)
+        with _JOBS_LOCK:
+            job["status"] = "aborted"
+            job["error"] = "Execution aborted by user."
+            job["elapsed_seconds"] = elapsed
+            job["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            job["logs"].append("[ABORTED] Execution stopped by user.")
+
     except Exception as exc:
         elapsed = round(time.perf_counter() - start_perf, 2)
         with _JOBS_LOCK:
@@ -117,7 +151,26 @@ def _run_job_thread(job_id: str, url: str, user_goal: str, csv_filename: str, ma
             job["elapsed_seconds"] = elapsed
             job["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             job["logs"].append(f"[ERROR] {type(exc).__name__}: {exc}")
+
     finally:
+        with _JOBS_LOCK:
+            job["loop"] = None
+            job["task"] = None
+            job["input_queue"] = None
+            job["pending_input"] = None
+        try:
+            pending = asyncio.all_tasks(loop)
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
         sys.stdout.flush()
         sys.stdout = orig_stdout
         builtins.input = orig_input
@@ -162,9 +215,13 @@ def start_scrape():
             "csv_filename": csv_filename,
             "max_steps": max_steps,
             "status": "running",
+            "abort_requested": False,
             "logs": [f"[Started] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Target: {url}"],
             "pending_input": None,
             "input_queue": None,
+            "cancel_event": None,
+            "loop": None,
+            "task": None,
             "result": None,
             "error": None,
             "elapsed_seconds": None,
@@ -191,6 +248,7 @@ def get_job_status(job_id: str):
         return jsonify({
             "id": job["id"],
             "status": job["status"],
+            "abort_requested": job["abort_requested"],
             "csv_filename": job["csv_filename"],
             "logs": logs,
             "next_index": after + len(logs),
@@ -200,6 +258,39 @@ def get_job_status(job_id: str):
             "elapsed_seconds": job["elapsed_seconds"],
             "finished_at": job["finished_at"],
         })
+
+
+@app.route("/api/jobs/<job_id>/abort", methods=["POST"])
+def abort_job(job_id: str):
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found."}), 404
+        if job["status"] != "running":
+            return jsonify({"error": f"Job is already {job['status']}."}), 400
+        if job.get("abort_requested"):
+            return jsonify({"ok": True, "status": "aborting"}), 202
+
+        job["abort_requested"] = True
+        job["logs"].append("[ABORT REQUESTED] Stopping execution...")
+
+        cancel_event = job.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+
+        q = job.get("input_queue")
+        if q is not None:
+            q.put(_ABORT_SENTINEL)
+
+        loop = job.get("loop")
+        task = job.get("task")
+        if loop is not None and task is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+
+    return jsonify({"ok": True, "status": "aborting"}), 202
 
 
 @app.route("/api/jobs/<job_id>/input", methods=["POST"])
